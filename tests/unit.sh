@@ -337,12 +337,19 @@ expect_failure "failed renewal state without nonzero exit is rejected" load_acme
 # --- certificate metadata with a real self-signed certificate ---
 CERT_DIR="$TEMP_DIR/cert"
 mkdir -p "$CERT_DIR"
+printf 'openssl: %s\n' "$(openssl version 2>/dev/null | head -1)"
 openssl ecparam -genkey -name prime256v1 -out "$CERT_DIR/key.pem" 2>/dev/null
 openssl req -new -x509 -days 90 -key "$CERT_DIR/key.pem" -out "$CERT_DIR/cert.pem" \
   -subj '//CN=example.com' -addext 'subjectAltName=DNS:example.com,DNS:www.example.com' 2>/dev/null
 chmod 600 "$CERT_DIR/key.pem" "$CERT_DIR/cert.pem"
-expect_success "certificate metadata is loaded" load_certificate_metadata \
-  "$CERT_DIR/cert.pem" "$CERT_DIR/key.pem"
+if load_certificate_metadata "$CERT_DIR/cert.pem" "$CERT_DIR/key.pem"; then
+  pass "certificate metadata is loaded"
+else
+  printf 'metadata load failed: state=%s dns=%s issuer=%s subject=%s fp=%s\n' \
+    "${CERT_META_STATE-}" "${CERT_META_DNS_NAMES-}" "${CERT_META_ISSUER-}" \
+    "${CERT_META_SUBJECT-}" "${CERT_META_FINGERPRINT-}" >&2
+  fail "certificate metadata is loaded"
+fi
 [[ $CERT_META_STATE == valid ]] || fail "self-signed certificate state"
 pass "self-signed certificate state"
 [[ $CERT_META_DNS_NAMES == *example.com* ]] || fail "certificate SAN names"

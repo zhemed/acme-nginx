@@ -1,0 +1,368 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+export LC_ALL=C
+
+ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+TEMP_DIR=$(mktemp -d)
+readonly ROOT_DIR TEMP_DIR
+trap 'rm -rf -- "$TEMP_DIR"' EXIT
+
+TEST_HAS_SYSTEM_FLOCK=1
+if ! command -v flock >/dev/null 2>&1; then
+  TEST_HAS_SYSTEM_FLOCK=0
+  mkdir -p "$TEMP_DIR/test-bin"
+  printf '%s\n' '#!/bin/bash' 'exit 0' > "$TEMP_DIR/test-bin/flock"
+  chmod 700 "$TEMP_DIR/test-bin/flock"
+  export PATH="$TEMP_DIR/test-bin:$PATH"
+fi
+
+passed=0
+
+pass(){
+  passed=$((passed + 1))
+  printf 'ok %d - %s\n' "$passed" "$1"
+}
+
+fail(){
+  printf 'not ok %d - %s\n' "$((passed + 1))" "$1" >&2
+  exit 1
+}
+
+expect_success(){
+  local name=$1
+  shift
+  if "$@"; then pass "$name"; else fail "$name"; fi
+}
+
+expect_failure(){
+  local name=$1
+  shift
+  if "$@"; then fail "$name"; else pass "$name"; fi
+}
+
+red(){ :; }
+green(){ :; }
+yellow(){ :; }
+blue(){ :; }
+white(){ :; }
+
+sanitize_location(){
+  tr '\r\n\t' '   ' | sed 's/[[:cntrl:]]//g; s/[[:space:]][[:space:]]*/ /g; s/^ //; s/ $//' | cut -c1-160
+}
+
+valid_ipv4(){ return 1; }
+valid_ipv6(){ return 1; }
+
+source "$ROOT_DIR/src/10-acme.sh"
+source "$ROOT_DIR/src/60-cron.sh"
+
+STATE_DIR="$TEMP_DIR/state"
+export STATE_DIR
+export CONFIG_FILE="$STATE_DIR/acme-nginx.conf"
+export ACME_HOME="$STATE_DIR/acme"
+export ACME_BIN="$ACME_HOME/acme.sh"
+export ACME_RELOAD="$STATE_DIR/reload.sh"
+export ACME_IDENTITY="$STATE_DIR/identity"
+export ACME_CERT="$STATE_DIR/fullchain.pem"
+export ACME_KEY="$STATE_DIR/privkey.pem"
+export ACME_STAGE="$ACME_HOME/stage"
+export ACME_STAGE_CERT="$ACME_STAGE/fullchain.pem"
+export ACME_STAGE_KEY="$ACME_STAGE/private.key"
+export ACME_LIVE="$STATE_DIR/live"
+export ACME_GENERATIONS="$ACME_LIVE/generations"
+export ACME_CURRENT="$ACME_LIVE/current"
+export ACME_LOCK="$STATE_DIR/acme.lock"
+export ACME_CRON_MARKER="# acme-nginx-managed"
+export ACME_RELOAD_IDENTITY="# acme-nginx-reload-v1"
+export ACME_RENEW_IDENTITY="# acme-nginx-renew-v1"
+export ACME_VERSION="3.1.4"
+export ACME_ARCHIVE_SHA256="e5f8e187bbf5251e0cd8891f2622daab9850366bd17bea9f92c2fe2ee091fd32"
+export ACME_RENEW_RUNNER="$STATE_DIR/renew.sh"
+export ACME_RENEW_STATE="$STATE_DIR/renew.state"
+mkdir -p "$STATE_DIR" "$ACME_HOME"
+
+valid_hostname(){
+  local name=$1 label
+  local -a labels
+  [[ ${#name} -le 253 && $name == *.* && $name != .* && $name != *. ]] || return 1
+  IFS='.' read -r -a labels <<< "$name"
+  for label in "${labels[@]}"; do
+    [[ ${#label} -ge 1 && ${#label} -le 63 ]] || return 1
+    [[ $label =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || return 1
+  done
+}
+# --- hostname ---
+expect_success "hostname is valid" valid_hostname sub.example.com
+expect_failure "single-label hostname is invalid" valid_hostname localhost
+expect_failure "leading-hyphen label is invalid" valid_hostname -bad.example.com
+expect_failure "trailing-hyphen label is invalid" valid_hostname bad-.example.com
+expect_failure "empty domain label is invalid" valid_hostname bad..example.com
+
+# --- Cloudflare account id ---
+expect_success "Cloudflare Account ID is valid" \
+  valid_cloudflare_account_id 0123456789ABCDEF0123456789abcdef
+expect_failure "short Cloudflare Account ID is invalid" valid_cloudflare_account_id 01234567
+expect_failure "31-character Account ID is invalid" \
+  valid_cloudflare_account_id 0123456789abcdef0123456789abcde
+expect_failure "non-hex Account ID is invalid" \
+  valid_cloudflare_account_id 0123456789abcdef0123456789abcdeg
+
+# --- domain normalization ---
+normalize_acme_domain ' Example.COM. ' || fail "single-domain normalization"
+[[ $ACME_PRIMARY_DOMAIN == example.com && -z $ACME_WILDCARD_DOMAIN ]] ||
+  fail "single-domain normalization values"
+pass "single-domain normalization"
+
+normalize_acme_domain '*.Example.COM' || fail "wildcard normalization"
+[[ $ACME_PRIMARY_DOMAIN == example.com && $ACME_WILDCARD_DOMAIN == '*.example.com' ]] ||
+  fail "wildcard normalization values"
+pass "wildcard normalization"
+expect_failure "embedded wildcard is invalid" normalize_acme_domain 'api.*.example.com'
+expect_failure "single-label ACME domain is invalid" normalize_acme_domain localhost
+
+config_mode_is_private(){
+  local mode
+  mode=$(stat -c '%a' "$CONFIG_FILE" 2>/dev/null || true)
+  case $(uname -s 2>/dev/null) in
+    MINGW*|MSYS*) return 0 ;;
+    *) [[ $mode == 600 ]] ;;
+  esac
+}
+
+config_is_present(){
+  [[ -f $CONFIG_FILE && ! -L $CONFIG_FILE ]] || return 1
+  config_mode_is_private
+}
+
+write_config_template(){
+  if [[ -e $CONFIG_FILE || -L $CONFIG_FILE ]]; then
+    [[ -f $CONFIG_FILE && ! -L $CONFIG_FILE ]] || return 1
+    return 0
+  fi
+  local tmp
+  tmp=$(mktemp "$STATE_DIR/.acme-nginx.conf.XXXXXX") || return 1
+  if ! {
+    printf '%s\n' '# acme-nginx 配置文件'
+    printf '%s\n' '# Cloudflare API 凭据（Account ID 为 32 位十六进制）'
+    printf '%s\n' 'CF_ACCOUNT_ID='
+    printf '%s\n' 'CF_TOKEN='
+    printf '%s\n' '# 主域名（必填）'
+    printf '%s\n' 'DOMAIN='
+    printf '%s\n' '# 是否同时申请泛域名证书：1 表示同时签 *.DOMAIN'
+    printf '%s\n' 'WILDCARD=0'
+  } > "$tmp" || ! chmod 600 "$tmp" || ! mv -fT -- "$tmp" "$CONFIG_FILE"; then
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
+load_config(){
+  local line key value
+  local account_count=0 token_count=0 domain_count=0 wildcard_count=0
+  local account='' token='' domain='' wildcard=''
+  [[ -f $CONFIG_FILE && ! -L $CONFIG_FILE ]] || return 1
+  config_mode_is_private || return 1
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ -n $line ]] || continue
+    [[ $line == \#* ]] && continue
+    [[ $line == *=* ]] || return 1
+    key=${line%%=*}
+    value=${line#*=}
+    [[ -n $value && $value != *"'"* && $value != *$'\r'* ]] || return 1
+    case $key in
+      CF_ACCOUNT_ID)
+        account_count=$((account_count + 1))
+        account=$value
+        ;;
+      CF_TOKEN)
+        token_count=$((token_count + 1))
+        token=$value
+        ;;
+      DOMAIN)
+        domain_count=$((domain_count + 1))
+        domain=$value
+        ;;
+      WILDCARD)
+        wildcard_count=$((wildcard_count + 1))
+        wildcard=$value
+        ;;
+      *) return 1 ;;
+    esac
+  done < "$CONFIG_FILE"
+  [[ $account_count -eq 1 && $token_count -eq 1 &&
+     $domain_count -eq 1 && $wildcard_count -eq 1 ]] || return 1
+  valid_cloudflare_account_id "$account" || return 1
+  [[ $token =~ ^[A-Za-z0-9_-]{10,200}$ ]] || return 1
+  [[ $wildcard == 0 || $wildcard == 1 ]] || return 1
+  normalize_acme_domain "$domain" || return 1
+  if [[ $wildcard == 1 ]]; then
+    ACME_WILDCARD_DOMAIN="*.$ACME_PRIMARY_DOMAIN"
+  else
+    ACME_WILDCARD_DOMAIN=
+  fi
+  CF_ACCOUNT_ID=$account
+  CF_TOKEN=$token
+}
+# --- config parsing ---
+write_config_fixture(){
+  local wildcard=${1:-0}
+  mkdir -p "$STATE_DIR"
+  cat > "$CONFIG_FILE" <<EOF
+CF_ACCOUNT_ID=0123456789abcdef0123456789abcdef
+CF_TOKEN=AbCdEfGhIjKlMnOpQrStUvWxYz0123456789
+DOMAIN=example.com
+WILDCARD=$wildcard
+EOF
+  chmod 600 "$CONFIG_FILE"
+}
+
+write_config_fixture 0
+expect_success "valid config is loaded" load_config
+[[ $CF_ACCOUNT_ID == 0123456789abcdef0123456789abcdef &&
+   $CF_TOKEN == AbCdEfGhIjKlMnOpQrStUvWxYz0123456789 &&
+   $ACME_PRIMARY_DOMAIN == example.com && -z $ACME_WILDCARD_DOMAIN ]] ||
+  fail "valid config values"
+pass "valid config values"
+
+write_config_fixture 1
+expect_success "wildcard config is loaded" load_config
+[[ $ACME_WILDCARD_DOMAIN == '*.example.com' ]] || fail "wildcard config value"
+pass "wildcard config value"
+
+sed -i '/^DOMAIN=/d' "$CONFIG_FILE"
+expect_failure "missing DOMAIN key is rejected" load_config
+write_config_fixture 0
+printf '%s\n' 'DOMAIN=other.com' >> "$CONFIG_FILE"
+expect_failure "duplicate DOMAIN key is rejected" load_config
+write_config_fixture 0
+sed -i 's/CF_ACCOUNT_ID=0123456789abcdef0123456789abcdef/CF_ACCOUNT_ID=short/' "$CONFIG_FILE"
+expect_failure "short Account ID is rejected" load_config
+write_config_fixture 0
+sed -i 's/CF_TOKEN=AbCdEfGhIjKlMnOpQrStUvWxYz0123456789/CF_TOKEN=short/' "$CONFIG_FILE"
+expect_failure "short Cloudflare token is rejected" load_config
+write_config_fixture 2
+expect_failure "invalid WILDCARD value is rejected" load_config
+write_config_fixture 0
+printf '%s\n' 'UNKNOWN_KEY=1' >> "$CONFIG_FILE"
+expect_failure "unknown config key is rejected" load_config
+write_config_fixture 0
+chmod 644 "$CONFIG_FILE"
+case $(uname -s 2>/dev/null) in
+  MINGW*|MSYS*) ;;
+  *) expect_failure "world-readable config is rejected" load_config ;;
+esac
+
+# --- Cloudflare credentials in acme.sh account.conf ---
+mkdir -p "$ACME_HOME"
+cat > "$ACME_HOME/account.conf" <<'EOF'
+SAVED_CF_Token='AbCdEfGhIjKlMnOpQrStUvWxYz0123456789'
+SAVED_CF_Account_ID='0123456789abcdef0123456789abcdef'
+EOF
+expect_success "stored Cloudflare credentials are present" cloudflare_acme_credentials_present
+rm -f "$ACME_HOME/account.conf"
+expect_failure "missing stored Cloudflare credentials are absent" cloudflare_acme_credentials_present
+printf '%s\n' "SAVED_CF_Token='bad'" > "$ACME_HOME/account.conf"
+expect_failure "malformed stored Cloudflare credentials are rejected" cloudflare_acme_credentials_present
+rm -f "$ACME_HOME/account.conf"
+
+# --- identity roundtrip ---
+expect_success "identity is written" write_acme_identity example.com
+[[ $(read_acme_identity) == example.com ]] || fail "identity readback"
+pass "identity readback"
+printf '%s\n' $'example.com\nextra.com' > "$ACME_IDENTITY"
+expect_failure "multi-line identity is rejected" read_acme_identity
+
+# --- reload hook ---
+expect_success "reload hook is written" write_acme_reload_hook
+expect_success "reload hook is current" acme_reload_hook_is_current
+grep -Fq 'systemctl reload nginx' "$ACME_RELOAD" || fail "hook contains systemd nginx reload"
+grep -Fq 'rc-service nginx reload' "$ACME_RELOAD" || fail "hook contains OpenRC nginx reload"
+grep -Fq 'shellcheck disable=SC2317,SC2329' "$ACME_RELOAD" || fail "hook disables SC2329"
+pass "hook nginx reload integration"
+bash -n "$ACME_RELOAD" || fail "hook passes bash -n"
+pass "hook passes bash -n"
+printf '%s\n' '#!/bin/bash' > "$ACME_RELOAD"
+chmod 700 "$ACME_RELOAD"
+expect_failure "unversioned hook is stale" acme_reload_hook_is_current
+rm -f "$ACME_RELOAD"
+expect_failure "missing hook is stale" acme_reload_hook_is_current
+
+# --- renew runner ---
+expect_success "renew runner is written" write_acme_renew_runner
+expect_success "renew runner is current" acme_renew_runner_is_current
+expect_success "renew runner is idempotent" write_acme_renew_runner
+grep -Fq "$ACME_RENEW_IDENTITY" "$ACME_RENEW_RUNNER" || fail "runner identity missing"
+pass "runner identity present"
+bash -n "$ACME_RENEW_RUNNER" || fail "runner passes bash -n"
+pass "runner passes bash -n"
+
+# --- cron entry ---
+expected_cron=$(acme_renew_cron_entry)
+expect_success "canonical ACME cron is current" acme_renew_cron_is_current "$expected_cron"
+expect_success "user cron may coexist" acme_renew_cron_is_current \
+  "15 2 * * * /root/user-task
+$expected_cron"
+expect_failure "marker-only ACME cron is stale" acme_renew_cron_is_current '# acme-nginx-managed'
+expect_failure "wrong ACME command is stale" acme_renew_cron_is_current \
+  '0 0 * * * false # acme-nginx-managed'
+expect_failure "duplicate ACME cron is stale" acme_renew_cron_is_current \
+  "$expected_cron
+$expected_cron"
+
+# --- lock ---
+expect_success "ACME lock is acquired" acquire_acme_lock
+expect_success "ACME lock is reentrant" acquire_acme_lock
+expect_success "ACME lock is released" release_acme_lock
+expect_success "ACME lock can be re-acquired" acquire_acme_lock
+release_acme_lock >/dev/null 2>&1 || true
+
+# --- renewal state ---
+state_epoch=1700000000
+write_state_fixture(){
+  cat > "$ACME_RENEW_STATE" <<EOF
+last_check_epoch=$state_epoch
+last_result=unchanged
+last_exit_code=0
+last_renewal_epoch=0
+cert_fingerprint=$(printf 'a%.0s' {1..64})
+EOF
+  chmod 600 "$ACME_RENEW_STATE"
+}
+write_state_fixture
+expect_success "renewal state is parsed" load_acme_renew_state
+[[ $ACME_RENEW_LAST_RESULT == unchanged && $ACME_RENEW_LAST_CHECK_EPOCH == "$state_epoch" ]] ||
+  fail "renewal state values"
+pass "renewal state values"
+printf '%s\n' 'broken' > "$ACME_RENEW_STATE"
+expect_failure "broken renewal state is rejected" load_acme_renew_state
+write_state_fixture
+sed -i 's/last_result=unchanged/last_result=failed/' "$ACME_RENEW_STATE"
+expect_failure "failed renewal state without nonzero exit is rejected" load_acme_renew_state
+
+# --- certificate metadata with a real self-signed certificate ---
+CERT_DIR="$TEMP_DIR/cert"
+mkdir -p "$CERT_DIR"
+openssl ecparam -genkey -name prime256v1 -out "$CERT_DIR/key.pem" 2>/dev/null
+openssl req -new -x509 -days 90 -key "$CERT_DIR/key.pem" -out "$CERT_DIR/cert.pem" \
+  -subj '//CN=example.com' -addext 'subjectAltName=DNS:example.com,DNS:www.example.com' 2>/dev/null
+chmod 600 "$CERT_DIR/key.pem" "$CERT_DIR/cert.pem"
+expect_success "certificate metadata is loaded" load_certificate_metadata \
+  "$CERT_DIR/cert.pem" "$CERT_DIR/key.pem"
+[[ $CERT_META_STATE == valid ]] || fail "self-signed certificate state"
+pass "self-signed certificate state"
+[[ $CERT_META_DNS_NAMES == *example.com* ]] || fail "certificate SAN names"
+pass "certificate SAN names"
+expect_success "certificate identity matches" certificate_identity_matches \
+  "$CERT_DIR/cert.pem" example.com
+expect_failure "certificate identity mismatch is rejected" certificate_identity_matches \
+  "$CERT_DIR/cert.pem" other.com
+expect_success "certificate key matches" certificate_key_matches \
+  "$CERT_DIR/cert.pem" "$CERT_DIR/key.pem"
+
+# --- source modules have formal markers ---
+for module in "$ROOT_DIR"/src/*.sh; do
+  [[ $(grep -Fc -- '# acme-nginx-module:' "$module" || true) -eq 1 ]] ||
+    fail "module marker missing in ${module##*/}"
+done
+pass "source module markers present"

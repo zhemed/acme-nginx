@@ -8,9 +8,7 @@ TEMP_DIR=$(mktemp -d)
 readonly ROOT_DIR TEMP_DIR
 trap 'rm -rf -- "$TEMP_DIR"' EXIT
 
-TEST_HAS_SYSTEM_FLOCK=1
 if ! command -v flock >/dev/null 2>&1; then
-  TEST_HAS_SYSTEM_FLOCK=0
   mkdir -p "$TEMP_DIR/test-bin"
   printf '%s\n' '#!/bin/bash' 'exit 0' > "$TEMP_DIR/test-bin/flock"
   chmod 700 "$TEMP_DIR/test-bin/flock"
@@ -41,12 +39,6 @@ expect_failure(){
   if "$@"; then fail "$name"; else pass "$name"; fi
 }
 
-red(){ :; }
-green(){ :; }
-yellow(){ :; }
-blue(){ :; }
-white(){ :; }
-
 sanitize_location(){
   tr '\r\n\t' '   ' | sed 's/[[:cntrl:]]//g; s/[[:space:]][[:space:]]*/ /g; s/^ //; s/ $//' | cut -c1-160
 }
@@ -54,7 +46,9 @@ sanitize_location(){
 valid_ipv4(){ return 1; }
 valid_ipv6(){ return 1; }
 
+# shellcheck source=/dev/null
 source "$ROOT_DIR/src/10-acme.sh"
+# shellcheck source=/dev/null
 source "$ROOT_DIR/src/60-cron.sh"
 
 STATE_DIR="$TEMP_DIR/state"

@@ -41,6 +41,7 @@ fi
 grep -Fq -- "当前版本：0.1.0" "$ROOT_DIR/README.md" ||
   fail "README project version is not 0.1.0"
 
+# shellcheck disable=SC2016
 for pattern in \
   'systemctl reload nginx' \
   'rc-service nginx reload' \
@@ -54,6 +55,7 @@ for pattern in \
   grep -Fq -- "$pattern" "$ROOT_DIR/acme-nginx.sh" ||
     fail "missing generated behavior: $pattern"
 done
+# shellcheck disable=SC2016
 for pattern in \
   'install)' \
   'issue)' \

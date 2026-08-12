@@ -34,18 +34,10 @@ ACME_WILDCARD_DOMAIN=
 CF_ACCOUNT_ID=
 CF_TOKEN=
 
-# shellcheck disable=SC2034
-red='\033[0;31m'
-green='\033[0;32m'
-yellow='\033[0;33m'
-blue='\033[0;36m'
-bblue='\033[0;34m'
-plain='\033[0m'
 red(){ echo -e "\033[31m\033[01m$1\033[0m";}
 green(){ echo -e "\033[32m\033[01m$1\033[0m";}
 yellow(){ echo -e "\033[33m\033[01m$1\033[0m";}
 blue(){ echo -e "\033[36m\033[01m$1\033[0m";}
-white(){ echo -e "\033[37m\033[01m$1\033[0m";}
 if [[ $EUID -ne 0 ]]; then
   yellow "请以root模式运行 acme-nginx"
   exit 1

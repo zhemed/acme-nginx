@@ -73,6 +73,10 @@ server {
 }
 ```
 
+## 部署指南
+
+服务器部署步骤见 [DEPLOY.md](DEPLOY.md)。
+
 ## 开发流程
 
 正式发布物是根目录 `acme-nginx.sh`（由 `scripts/build.sh` 从 `src/` 拼接生成）。

@@ -338,9 +338,13 @@ expect_failure "failed renewal state without nonzero exit is rejected" load_acme
 CERT_DIR="$TEMP_DIR/cert"
 mkdir -p "$CERT_DIR"
 printf 'openssl: %s\n' "$(openssl version 2>/dev/null | head -1)"
-openssl ecparam -genkey -name prime256v1 -out "$CERT_DIR/key.pem" 2>/dev/null
-openssl req -new -x509 -days 90 -key "$CERT_DIR/key.pem" -out "$CERT_DIR/cert.pem" \
-  -subj '//CN=example.com' -addext 'subjectAltName=DNS:example.com,DNS:www.example.com' 2>/dev/null
+(
+  cd "$CERT_DIR" || exit 1
+  openssl ecparam -genkey -name prime256v1 -out key.pem 2>/dev/null
+  MSYS2_ARG_CONV_EXCL='*' openssl req -new -x509 -days 90 -key key.pem -out cert.pem \
+    -subj '/CN=example.com' \
+    -addext 'subjectAltName=DNS:example.com,DNS:www.example.com' 2>/dev/null
+)
 chmod 600 "$CERT_DIR/key.pem" "$CERT_DIR/cert.pem"
 if load_certificate_metadata "$CERT_DIR/cert.pem" "$CERT_DIR/key.pem"; then
   pass "certificate metadata is loaded"

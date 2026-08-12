@@ -229,23 +229,15 @@ certificate_san_text(){
 }
 
 certificate_identity_matches(){
-  local cert=$1 identity=$2 check_option san
+  local cert=$1 identity=$2 san
   if valid_ipv4 "$identity" || valid_ipv6 "$identity"; then
-    check_option=checkip
+    san=$(certificate_san_text "$cert") || return 1
+    printf '%s\n' "$san" | grep -oE 'IP Address:[^,[:space:]]+' | cut -d: -f2- | grep -Fxq -- "$identity"
   elif valid_hostname "$identity"; then
-    check_option=checkhost
+    san=$(certificate_san_text "$cert") || return 1
+    printf '%s\n' "$san" | grep -oE 'DNS:[^,[:space:]]+' | cut -d: -f2- | grep -Fxiq -- "$identity"
   else
     return 1
-  fi
-  if openssl x509 -help 2>&1 | grep -q -- "-$check_option"; then
-    openssl x509 -in "$cert" -noout "-$check_option" "$identity" >/dev/null 2>&1
-    return
-  fi
-  san=$(certificate_san_text "$cert") || return 1
-  if [[ $check_option == checkip ]]; then
-    printf '%s\n' "$san" | grep -oE 'IP Address:[^,[:space:]]+' | cut -d: -f2- | grep -Fxq -- "$identity"
-  else
-    printf '%s\n' "$san" | grep -oE 'DNS:[^,[:space:]]+' | cut -d: -f2- | grep -Fxiq -- "$identity"
   fi
 }
 
@@ -704,16 +696,12 @@ openssl x509 -in "$stage_cert" -noout -checkend 0 >/dev/null 2>&1 || exit 1
 not_before=$(openssl x509 -in "$stage_cert" -noout -startdate 2>/dev/null | cut -d= -f2-) || exit 1
 not_before_epoch=$(date -d "$not_before" +%s 2>/dev/null) || exit 1
 [[ $not_before_epoch -le $(date +%s) ]] || exit 1
-if openssl x509 -help 2>&1 | grep -q -- '-checkhost'; then
-  openssl x509 -in "$stage_cert" -noout -checkhost "$identity" >/dev/null 2>&1 || exit 1
+if openssl x509 -help 2>&1 | grep -q -- '-ext'; then
+  san=$(openssl x509 -in "$stage_cert" -noout -ext subjectAltName 2>/dev/null) || exit 1
 else
-  if openssl x509 -help 2>&1 | grep -q -- '-ext'; then
-    san=$(openssl x509 -in "$stage_cert" -noout -ext subjectAltName 2>/dev/null) || exit 1
-  else
-    san=$(openssl x509 -in "$stage_cert" -noout -text 2>/dev/null | awk '/X509v3 Subject Alternative Name/{getline; print; exit}') || exit 1
-  fi
-  printf '%s\n' "$san" | grep -oE 'DNS:[^,[:space:]]+' | cut -d: -f2- | grep -Fxiq -- "$identity" || exit 1
+  san=$(openssl x509 -in "$stage_cert" -noout -text 2>/dev/null | awk '/X509v3 Subject Alternative Name/{getline; print; exit}') || exit 1
 fi
+printf '%s\n' "$san" | grep -oE 'DNS:[^,[:space:]]+' | cut -d: -f2- | grep -Fxiq -- "$identity" || exit 1
 cert_public=$(openssl x509 -in "$stage_cert" -pubkey -noout 2>/dev/null) || exit 1
 key_public=$(openssl pkey -in "$stage_key" -pubout 2>/dev/null) || exit 1
 [[ -n "$cert_public" && "$cert_public" == "$key_public" ]] || exit 1

@@ -34,6 +34,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File D:\xx\acme-nginx\win\sshx.ps
 
 - `-Target` **必填**（`user@host` 或 SSH 配置别名）；仓库内不保存任何服务器地址。
 - `-Command` 与 `-Encoded` 二选一；远程退出码会原样返回，调用方可立即失败。
+- **从 PowerShell 调用时**：含空格/引号的 `-Command` 可能被外层重新解析，复杂命令请一律用 `-Encoded`（base64 预编码），这是最可靠的方式。
 
 ## 安全策略（必须遵守）
 

@@ -1840,7 +1840,8 @@ cmd_issue(){
   if identity=$(read_acme_identity 2>/dev/null) &&
      load_certificate_metadata "$ACME_CERT" "$ACME_KEY" 2>/dev/null &&
      [[ $CERT_META_STATE == valid ]] &&
-     certificate_identity_matches "$ACME_CERT" "$identity"; then
+     certificate_identity_matches "$ACME_CERT" "$identity" &&
+     load_acme_certificate_schedule "$identity" 2>/dev/null; then
     yellow "已存在有效证书（$identity），无需重复签发；如需重签请运行 acme-nginx force-renew"
     return 0
   fi

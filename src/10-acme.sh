@@ -330,7 +330,13 @@ _hwak_canonical_query(){
 
 _hwak_sign(){
   local method=$1 path=$2 query=$3 headers=$4 signed=$5 body=$6 sdk_date=$7
-  local payload_hash canonical string2sign signature
+  local payload_hash canonical string2sign signature nl
+  nl='
+'
+  case $headers in
+    *"$nl") ;;
+    *) headers="$headers$nl" ;;
+  esac
   case $path in
     */) ;;
     *) path="$path/" ;;
@@ -347,7 +353,7 @@ _hwak_sign(){
 
 _hwak_request(){
   local method=$1 path=$2 query=$3 body=$4
-  local sdk_date endpoint headers signed auth url code response out
+  local sdk_date endpoint headers signed auth url code response out canonical_query
   [ -n "$HUAWEICLOUD_ACCESS_KEY_ID" ] || return 1
   [ -n "$HUAWEICLOUD_SECRET_ACCESS_KEY" ] || return 1
   [ -n "$HUAWEICLOUD_REGION" ] || return 1
@@ -355,9 +361,10 @@ _hwak_request(){
   endpoint="dns.$HUAWEICLOUD_REGION.myhuaweicloud.com"
   headers=$(printf 'content-type:application/json\nhost:%s\nx-sdk-date:%s\n' "$endpoint" "$sdk_date")
   signed='content-type;host;x-sdk-date'
-  auth=$(_hwak_sign "$method" "$path" "$query" "$headers" "$signed" "$body" "$sdk_date") || return 1
+  canonical_query=$(_hwak_canonical_query "$query")
   url="https://$endpoint$path"
-  [ -z "$query" ] || url="$url?$query"
+  [ -z "$canonical_query" ] || url="$url?$canonical_query"
+  auth=$(_hwak_sign "$method" "$path" "$canonical_query" "$headers" "$signed" "$body" "$sdk_date") || return 1
   out=$(mktemp "${TMPDIR:-/tmp}/hwak.XXXXXX") || return 1
   if [ -n "$body" ]; then
     code=$(curl -sS -o "$out" -w '%{http_code}' -X "$method" \

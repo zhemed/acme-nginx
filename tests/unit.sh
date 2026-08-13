@@ -555,6 +555,24 @@ expected="SDK-HMAC-SHA256 Access=$HUAWEICLOUD_ACCESS_KEY_ID, SignedHeaders=$sign
 [[ $actual == "$expected" ]] || fail "AK/SK signing vector"
 pass "AK/SK signing vector"
 
+headers_no_nl=$(printf 'content-type:application/json\nhost:dns.cn-north-4.myhuaweicloud.com\nx-sdk-date:%s' "$sdk_date")
+actual2=$(HUAWEICLOUD_ACCESS_KEY_ID="$HUAWEICLOUD_ACCESS_KEY_ID" HUAWEICLOUD_SECRET_ACCESS_KEY="$HUAWEICLOUD_SECRET_ACCESS_KEY" \
+  _hwak_sign GET "/v2/zones" "type=public&name=example.com" "$headers_no_nl" "$signed_headers" "" "$sdk_date")
+[[ $actual2 == "$expected" ]] || fail "AK/SK signing vector without trailing header newline"
+pass "AK/SK signing vector without trailing header newline"
+
+expect_success "canonical query is produced" _hwak_canonical_query 'type=public&name=example.com'
+[[ $(_hwak_canonical_query 'type=public&name=example.com') == 'name=example.com&type=public' ]] ||
+  fail "canonical query order"
+pass "canonical query order"
+pass "AK/SK signing vector"
+
+headers_no_nl=$(printf 'content-type:application/json\nhost:dns.cn-north-4.myhuaweicloud.com\nx-sdk-date:%s' "$sdk_date")
+actual2=$(HUAWEICLOUD_ACCESS_KEY_ID="$HUAWEICLOUD_ACCESS_KEY_ID" HUAWEICLOUD_SECRET_ACCESS_KEY="$HUAWEICLOUD_SECRET_ACCESS_KEY" \
+  _hwak_sign GET "/v2/zones" "type=public&name=example.com" "$headers_no_nl" "$signed_headers" "" "$sdk_date")
+[[ $actual2 == "$expected" ]] || fail "AK/SK signing vector without trailing header newline"
+pass "AK/SK signing vector without trailing header newline"
+
 HW_ZONE_JSON='{"zones":[{"id":"zone-1","name":"example.com."}]}'
 HW_RS_JSON='{"recordsets":[]}'
 curl(){
@@ -578,7 +596,7 @@ curl(){
 }
 : > "$TEMP_DIR/curl.log"
 expect_success "aksk add creates a TXT record" dns_huaweicloud_aksk_add _acme-challenge.example.com abc123
-grep -Fq 'CURL GET https://dns.cn-north-4.myhuaweicloud.com/v2/zones?type=public&name=example.com' "$TEMP_DIR/curl.log" ||
+grep -Fq 'CURL GET https://dns.cn-north-4.myhuaweicloud.com/v2/zones?name=example.com&type=public' "$TEMP_DIR/curl.log" ||
   fail "zone lookup URL"
 grep -Fq 'CURL POST https://dns.cn-north-4.myhuaweicloud.com/v2/zones/zone-1/recordsets' "$TEMP_DIR/curl.log" ||
   fail "recordset create URL"

@@ -1239,7 +1239,7 @@ register_acme_certificate_deployment(){
 
 issue_certificate(){
   local -a issue_args
-  local provider plugin
+  local provider plugin current_identity
   provider=${DNS_PROVIDER:-cloudflare}
   [[ -n ${ACME_PRIMARY_DOMAIN:-} ]] || return 1
   valid_dns_provider "$provider" || return 1
@@ -1263,6 +1263,15 @@ issue_certificate(){
     issue_args+=(--server https://acme-staging-v02.api.letsencrypt.org/directory)
   else
     issue_args+=(--server letsencrypt)
+  fi
+  if [[ -n ${ACME_PRIMARY_DOMAIN:-} ]] &&
+     current_identity=$(read_acme_identity 2>/dev/null) &&
+     load_certificate_metadata "$ACME_CERT" "$ACME_KEY" 2>/dev/null &&
+     [[ $CERT_META_STATE == valid ]] &&
+     certificate_identity_matches "$ACME_CERT" "$current_identity" &&
+     ! load_acme_certificate_schedule "$current_identity" 2>/dev/null; then
+    issue_args+=(--force)
+    yellow "检测到已有证书但签发机构与当前配置不一致，将强制重新签发"
   fi
   if [[ -n ${ACME_WILDCARD_DOMAIN:-} ]]; then
     issue_args+=(-d "$ACME_WILDCARD_DOMAIN")

@@ -173,7 +173,7 @@ write_config_template(){
     printf '%s\n' 'HUAWEICLOUD_SECRET_ACCESS_KEY='
     printf '%s\n' '# 区域（必填），国内建议 cn-north-4，如 cn-north-4/ap-southeast-1'
     printf '%s\n' 'HUAWEICLOUD_REGION='
-    printf '%s\n' '# 联调用 Let''s Encrypt 预演服务器：1 开启，生产保持 0'
+    printf '%s\n' '# 默认 0 直接申请正式证书；1 仅用于调试预演环境（一般不需要）'
     printf '%s\n' 'STAGING=0'
     printf '%s\n' '# 主域名（必填）'
     printf '%s\n' 'DOMAIN='

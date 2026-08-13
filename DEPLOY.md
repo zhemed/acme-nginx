@@ -71,7 +71,7 @@ WILDCARD=1
 
   华为云凭据获取：控制台「我的凭证」→「访问密钥」创建 AK/SK，建议使用仅授
   DNS 云解析权限的子账号 AK/SK；`HUAWEICLOUD_REGION` 必填（决定 API 域名）；
-  `STAGING=1` 用 Let's Encrypt 预演服务器联调，生产保持 `0`；预演验证通过后改回 `STAGING=0` 再运行 `acme-nginx issue` 即可切换为正式证书。
+  `STAGING`：默认 `0`，直接申请正式证书（推荐）；`1` 仅用于调试预演环境，一般不需要。
   注意：v0.2.0 的 IAM 账号密码配置在 v0.3.0 不再兼容。
 - `DOMAIN`：主域名（必填）。
 - `WILDCARD`：可选，默认 0。

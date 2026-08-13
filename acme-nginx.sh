@@ -443,7 +443,13 @@ read_acme_domain_conf_value(){
   [[ $count -eq 1 ]] || return 1
   case "$key" in
     Le_Domain) valid_hostname "$value" ;;
-    Le_API) [[ $value == 'https://acme-v02.api.letsencrypt.org/directory' ]] ;;
+    Le_API)
+      if [[ ${STAGING:-0} == 1 ]]; then
+        [[ $value == 'https://acme-staging-v02.api.letsencrypt.org/directory' ]]
+      else
+        [[ $value == 'https://acme-v02.api.letsencrypt.org/directory' ]]
+      fi
+      ;;
     Le_CertCreateTime|Le_NextRenewTime|Le_InstallCertSuccessTime)
       [[ $value =~ ^[0-9]{1,12}$ ]]
       ;;

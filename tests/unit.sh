@@ -533,6 +533,33 @@ expect_failure "certificate identity mismatch is rejected" certificate_identity_
 expect_success "certificate key matches" certificate_key_matches \
   "$CERT_DIR/cert.pem" "$CERT_DIR/key.pem"
 
+# --- ACME schedule accepts staging API in staging mode, production otherwise ---
+SCHEDULE_DIR="$ACME_HOME/certs/cs.miio.cc_ecc"
+mkdir -p "$SCHEDULE_DIR"
+SCHEDULE_CONF="$SCHEDULE_DIR/cs.miio.cc.conf"
+cat > "$SCHEDULE_CONF" <<'EOF'
+Le_Domain='cs.miio.cc'
+Le_API='https://acme-staging-v02.api.letsencrypt.org/directory'
+Le_CertCreateTime='1720000000'
+Le_NextRenewTime='1725000000'
+Le_InstallCertSuccessTime='1720000100'
+EOF
+chmod 600 "$SCHEDULE_CONF"
+STAGING=1
+expect_success "staging schedule is accepted in staging mode" \
+  load_acme_certificate_schedule cs.miio.cc
+STAGING=0
+expect_failure "staging schedule is rejected in production mode" \
+  load_acme_certificate_schedule cs.miio.cc
+sed -i 's#https://acme-staging-v02.api.letsencrypt.org/directory#https://acme-v02.api.letsencrypt.org/directory#' \
+  "$SCHEDULE_CONF"
+expect_success "production schedule is accepted in production mode" \
+  load_acme_certificate_schedule cs.miio.cc
+STAGING=1
+expect_failure "production schedule is rejected in staging mode" \
+  load_acme_certificate_schedule cs.miio.cc
+STAGING=0
+
 # --- Huawei Cloud AK/SK plugin ---
 export DNS_PROVIDER=huaweicloud
 mkdir -p "$ACME_HOME/dnsapi"

@@ -773,7 +773,8 @@ huawei_aksk_plugin_ok(){
 install_official_acme(){
   local temp_dir archive source_dir actual_sha256 installed_version plugin
   plugin=$(dns_provider_plugin_file) || return 1
-  if [[ -x $ACME_BIN && -f $ACME_HOME/dnsapi/$plugin ]]; then
+  if [[ -x $ACME_BIN ]] && \
+     { [[ ${DNS_PROVIDER:-cloudflare} == huaweicloud ]] || [[ -f $ACME_HOME/dnsapi/$plugin ]]; }; then
     installed_version=$(HOME="$STATE_DIR" "$ACME_BIN" --version 2>/dev/null)
     if printf '%s\n' "$installed_version" | grep -Fxq "v$ACME_VERSION"; then
       if [[ ${DNS_PROVIDER:-cloudflare} == huaweicloud ]]; then
@@ -800,7 +801,7 @@ install_official_acme(){
     return 1
   fi
   if ! tar -xzf "$archive" -C "$temp_dir" || [[ ! -f $source_dir/acme.sh ]] || \
-     [[ ! -f $source_dir/dnsapi/$plugin ]] || \
+     { [[ ${DNS_PROVIDER:-cloudflare} != huaweicloud ]] && [[ ! -f $source_dir/dnsapi/$plugin ]]; } || \
      ! (cd "$source_dir" && HOME="$STATE_DIR" bash ./acme.sh --install \
        --home "$ACME_HOME" --config-home "$ACME_HOME" --cert-home "$ACME_HOME/certs" \
        --no-cron --no-profile); then
@@ -810,7 +811,8 @@ install_official_acme(){
   fi
   rm -rf "$temp_dir"
   installed_version=$(HOME="$STATE_DIR" "$ACME_BIN" --version 2>/dev/null)
-  if [[ ! -x $ACME_BIN || ! -f $ACME_HOME/dnsapi/$plugin ]] || \
+  if [[ ! -x $ACME_BIN ]] || \
+     { [[ ${DNS_PROVIDER:-cloudflare} != huaweicloud ]] && [[ ! -f $ACME_HOME/dnsapi/$plugin ]]; } || \
      ! printf '%s\n' "$installed_version" | grep -Fxq "v$ACME_VERSION"; then
     red "官方 acme.sh 安装不完整"
     return 1

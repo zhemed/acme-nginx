@@ -524,6 +524,17 @@ expect_success "huawei aksk plugin is current" huawei_aksk_plugin_ok
 bash -n "$ACME_HOME/dnsapi/dns_huaweicloud_aksk.sh" || fail "plugin passes bash -n"
 pass "plugin passes bash -n"
 
+# --- install_official_acme restores missing huawei plugin (v0.3.0 fix) ---
+cat > "$ACME_BIN" <<'EOF'
+#!/bin/bash
+[[ ${1:-} == --version ]] && echo "v3.1.4"
+exit 0
+EOF
+chmod 700 "$ACME_BIN"
+rm -f "$ACME_HOME/dnsapi/dns_huaweicloud_aksk.sh"
+expect_success "install_official_acme restores missing huawei plugin" install_official_acme
+expect_success "huawei plugin is current after restore" huawei_aksk_plugin_ok
+
 _err(){ :; }
 _readaccountconf_mutable(){ :; }
 _saveaccountconf_mutable(){ :; }

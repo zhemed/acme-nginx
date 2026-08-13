@@ -43,20 +43,22 @@ WILDCARD=1        # 1 表示同时申请 *.example.com，0 只申请单域名
 
 - `DNS_PROVIDER`：DNS 供应商，`cloudflare` 或 `huaweicloud`，默认 `cloudflare`。
 - Cloudflare 模式：`CF_ACCOUNT_ID`（32 位十六进制）+ `CF_TOKEN`（Zone.DNS 编辑权限）。
-- 华为云模式（DNS_PROVIDER=huaweicloud）：
+- 华为云模式（DNS_PROVIDER=huaweicloud，v0.3.0 起仅 AK/SK）：
 
 ```ini
 DNS_PROVIDER=huaweicloud
-HUAWEICLOUD_USERNAME=IAM子账号用户名
-HUAWEICLOUD_PASSWORD=子账号密码
-HUAWEICLOUD_DOMAINNAME=华为云账号名
-HUAWEICLOUD_REGION=cn-north-4    # 可选，默认 ap-southeast-1
+HUAWEICLOUD_ACCESS_KEY_ID=你的AccessKeyId
+HUAWEICLOUD_SECRET_ACCESS_KEY=你的SecretAccessKey
+HUAWEICLOUD_REGION=cn-north-4
+STAGING=0
 DOMAIN=example.com
 WILDCARD=1
 ```
 
-  - 华为云凭据在控制台「统一身份认证」创建子账号，并在「我的凭证」查看账号名；
-  - `HUAWEICLOUD_REGION` 可选，默认 `ap-southeast-1`，国内建议 `cn-north-4` 等实际区域。
+  - AK/SK 在控制台「我的凭证」→「访问密钥」创建，建议使用仅授 DNS 云解析权限的子账号 AK/SK；
+  - `HUAWEICLOUD_REGION` 必填，决定 API 域名 `dns.<region>.myhuaweicloud.com`；
+  - `STAGING=1` 使用 Let's Encrypt 预演服务器联调，生产保持 `0`；
+  - 注意：v0.3.0 起华为云仅支持 AK/SK，v0.2.0 的 IAM 账号密码配置不再兼容。
 - `DOMAIN`：主域名（必填）。
 - `WILDCARD`：可选，默认 0。
 
@@ -112,7 +114,7 @@ bash tests/verify.sh
 
 ## 固定版本
 
-- 当前版本：0.2.0
+- 当前版本：0.3.0
 - acme.sh 固定为 `3.1.4`
 - 上游下载仅 HTTPS，并在执行前核对项目内固定的 SHA-256
 - 签发服务：Let's Encrypt（acme-v02）

@@ -7,7 +7,7 @@
 - 一台 Linux 服务器，有 root 权限（或可 sudo）。
 - 已安装 Nginx（未安装时可在部署后自行安装：Debian/Ubuntu `apt install nginx`，CentOS `dnf install nginx`，Alpine `apk add nginx`）。
 - 目标域名已解析到本服务器 IP。
-- DNS 供应商凭据（二选一）：Cloudflare（Account ID + API Token，Token 需该域名 Zone 的 **Zone.Zone Read** 与 **Zone.DNS Edit** 权限）或华为云（IAM 子账号用户名/密码 + 华为云账号名）。
+- DNS 供应商凭据（二选一）：Cloudflare（Account ID + API Token，Token 需该域名 Zone 的 **Zone.Zone Read** 与 **Zone.DNS Edit** 权限）或华为云（AK/SK：控制台“我的凭证”→“访问密钥”创建，需 DNS 云解析权限）。
 - 服务器能访问 GitHub（安装固定版本 acme.sh 时需要）。
 
 ## 一、获取并安装 acme-nginx
@@ -57,20 +57,22 @@ WILDCARD=1        # 1 表示同时申请 *.example.com，0 只申请单域名
 
 - `DNS_PROVIDER`：DNS 供应商，`cloudflare` 或 `huaweicloud`，默认 `cloudflare`。
 - Cloudflare 模式：`CF_ACCOUNT_ID`（32 位十六进制）+ `CF_TOKEN`（Zone.DNS 编辑权限）。
-- 华为云模式（域名 DNS 托管在华为云时）：
+- 华为云模式（域名 DNS 托管在华为云时，v0.3.0 起仅 AK/SK）：
 
 ```ini
 DNS_PROVIDER=huaweicloud
-HUAWEICLOUD_USERNAME=IAM子账号用户名
-HUAWEICLOUD_PASSWORD=子账号密码
-HUAWEICLOUD_DOMAINNAME=华为云账号名
-HUAWEICLOUD_REGION=cn-north-4    # 可选，默认 ap-southeast-1
+HUAWEICLOUD_ACCESS_KEY_ID=你的AccessKeyId
+HUAWEICLOUD_SECRET_ACCESS_KEY=你的SecretAccessKey
+HUAWEICLOUD_REGION=cn-north-4
+STAGING=0
 DOMAIN=example.com
 WILDCARD=1
 ```
 
-  华为云凭据获取：控制台「统一身份认证」创建子账号（权限需包含 DNS 云解析），
-  「我的凭证」中查看账号名（DomainName）。
+  华为云凭据获取：控制台「我的凭证」→「访问密钥」创建 AK/SK，建议使用仅授
+  DNS 云解析权限的子账号 AK/SK；`HUAWEICLOUD_REGION` 必填（决定 API 域名）；
+  `STAGING=1` 用 Let's Encrypt 预演服务器联调，生产保持 `0`。
+  注意：v0.2.0 的 IAM 账号密码配置在 v0.3.0 不再兼容。
 - `DOMAIN`：主域名（必填）。
 - `WILDCARD`：可选，默认 0。
 
@@ -139,7 +141,7 @@ acme-nginx uninstall      # 卸载（移除 cron、证书、状态与配置）
 
 | 现象 | 处理 |
 | --- | --- |
-| `issue` 报 DNS 验证失败 | Cloudflare：检查 Token 是否有 Zone.DNS Edit 权限；华为云：检查 IAM 子账号权限与 `HUAWEICLOUD_REGION` 是否正确，域名是否托管在该供应商 |
+| `issue` 报 DNS 验证失败 | Cloudflare：检查 Token 是否有 Zone.DNS Edit 权限；华为云：检查 AK/SK 是否有 DNS 云解析权限、`HUAWEICLOUD_REGION` 是否正确、域名是否托管在华为云 |
 | `install` 报 acme.sh 下载失败 | 确认服务器可访问 GitHub，或临时设置代理后重试 |
 | `status` 显示自动续期异常 | 检查 `systemctl status cron`（或 `rc-service crond status`）是否运行 |
 | 证书已签发但 Nginx 未生效 | 手动 `nginx -t && systemctl reload nginx`，检查 server 块是否引用 `/etc/acme-nginx/fullchain.pem` |

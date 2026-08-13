@@ -34,12 +34,12 @@ grep -Fq -- 'https://codeload.github.com/acmesh-official/acme.sh/tar.gz/refs/tag
 if grep -Fq -- '--install-online' "$ROOT_DIR/acme-nginx.sh"; then
   fail "unverified acme.sh online installer remains"
 fi
-[[ $(grep -Fxc 'acme_nginx_version="v0.2.0"' "$ROOT_DIR/acme-nginx.sh" || true) -eq 1 ]] ||
-  fail "script version is not 0.2.0"
-[[ $(tr -d '\r\n' < "$ROOT_DIR/VERSION") == '0.2.0' ]] ||
-  fail "VERSION file is not 0.2.0"
-grep -Fq -- "当前版本：0.2.0" "$ROOT_DIR/README.md" ||
-  fail "README project version is not 0.2.0"
+[[ $(grep -Fxc 'acme_nginx_version="v0.3.0"' "$ROOT_DIR/acme-nginx.sh" || true) -eq 1 ]] ||
+  fail "script version is not 0.3.0"
+[[ $(tr -d '\r\n' < "$ROOT_DIR/VERSION") == '0.3.0' ]] ||
+  fail "VERSION file is not 0.3.0"
+grep -Fq -- "当前版本：0.3.0" "$ROOT_DIR/README.md" ||
+  fail "README project version is not 0.3.0"
 
 # shellcheck disable=SC2016
 for pattern in \
@@ -52,8 +52,8 @@ for pattern in \
   'ACMERELOAD' \
   'ACMERENEW' \
   '17 3,9,15,21 * * *' \
-  'dns_huaweicloud' \
-  'HUAWEICLOUD_Username'; do
+  'dns_huaweicloud_aksk' \
+  'SDK-HMAC-SHA256'; do
   grep -Fq -- "$pattern" "$ROOT_DIR/acme-nginx.sh" ||
     fail "missing generated behavior: $pattern"
 done
@@ -69,6 +69,9 @@ for pattern in \
   grep -Fq -- "$pattern" "$ROOT_DIR/acme-nginx.sh" ||
     fail "missing CLI surface: $pattern"
 done
+if grep -Fq -- 'HUAWEICLOUD_PASSWORD' "$ROOT_DIR/acme-nginx.sh"; then
+  fail "legacy Huawei IAM credential key remains in the generated script"
+fi
 if grep -Fq -- 'readp' "$ROOT_DIR/acme-nginx.sh"; then
   fail "interactive panel prompt remains"
 fi
@@ -76,7 +79,7 @@ if grep -Fq -- 'menu(){' "$ROOT_DIR/acme-nginx.sh"; then
   fail "interactive menu remains"
 fi
 
-for config_key in DNS_PROVIDER CF_ACCOUNT_ID CF_TOKEN HUAWEICLOUD_USERNAME HUAWEICLOUD_PASSWORD HUAWEICLOUD_DOMAINNAME HUAWEICLOUD_REGION DOMAIN WILDCARD; do
+for config_key in DNS_PROVIDER CF_ACCOUNT_ID CF_TOKEN HUAWEICLOUD_ACCESS_KEY_ID HUAWEICLOUD_SECRET_ACCESS_KEY HUAWEICLOUD_REGION STAGING DOMAIN WILDCARD; do
   grep -Fq -- "$config_key" "$ROOT_DIR/README.md" ||
     fail "README documents config key: $config_key"
 done

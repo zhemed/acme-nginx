@@ -34,10 +34,10 @@ ACME_WILDCARD_DOMAIN=
 DNS_PROVIDER=cloudflare
 CF_ACCOUNT_ID=
 CF_TOKEN=
-HUAWEICLOUD_USERNAME=
-HUAWEICLOUD_PASSWORD=
-HUAWEICLOUD_DOMAINNAME=
+HUAWEICLOUD_ACCESS_KEY_ID=
+HUAWEICLOUD_SECRET_ACCESS_KEY=
 HUAWEICLOUD_REGION=
+STAGING=0
 
 red(){ echo -e "\033[31m\033[01m$1\033[0m";}
 green(){ echo -e "\033[32m\033[01m$1\033[0m";}
@@ -48,7 +48,7 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-acme_nginx_version="v0.2.0"
+acme_nginx_version="v0.3.0"
 
 valid_ipv4(){
   local ip=$1 IFS=. octets octet
@@ -167,13 +167,14 @@ write_config_template(){
     printf '%s\n' '# Account ID 为 32 位十六进制'
     printf '%s\n' 'CF_ACCOUNT_ID='
     printf '%s\n' 'CF_TOKEN='
-    printf '%s\n' '# --- 华为云凭据（DNS_PROVIDER=huaweicloud 时必填）---'
-    printf '%s\n' '# IAM 子账号用户名/密码，及华为云账号名（控制台“我的凭证”中查看）'
-    printf '%s\n' 'HUAWEICLOUD_USERNAME='
-    printf '%s\n' 'HUAWEICLOUD_PASSWORD='
-    printf '%s\n' 'HUAWEICLOUD_DOMAINNAME='
-    printf '%s\n' '# 可选，默认 ap-southeast-1；国内建议 cn-north-4'
+    printf '%s\n' '# --- 华为云凭据（DNS_PROVIDER=huaweicloud 时必填，AK/SK 模式）---'
+    printf '%s\n' '# AK/SK：控制台“我的凭证”→“访问密钥”中创建'
+    printf '%s\n' 'HUAWEICLOUD_ACCESS_KEY_ID='
+    printf '%s\n' 'HUAWEICLOUD_SECRET_ACCESS_KEY='
+    printf '%s\n' '# 区域（必填），国内建议 cn-north-4，如 cn-north-4/ap-southeast-1'
     printf '%s\n' 'HUAWEICLOUD_REGION='
+    printf '%s\n' '# 联调用 Let''s Encrypt 预演服务器：1 开启，生产保持 0'
+    printf '%s\n' 'STAGING=0'
     printf '%s\n' '# 主域名（必填）'
     printf '%s\n' 'DOMAIN='
     printf '%s\n' '# 是否同时申请泛域名证书：1 表示同时签 *.DOMAIN'
@@ -187,9 +188,9 @@ write_config_template(){
 load_config(){
   local line key value
   local provider_count=0 account_count=0 token_count=0 domain_count=0 wildcard_count=0
-  local hw_user_count=0 hw_pass_count=0 hw_domain_count=0 hw_region_count=0
+  local hw_ak_count=0 hw_sk_count=0 hw_region_count=0 staging_count=0
   local provider='' account='' token='' domain='' wildcard=''
-  local hw_user='' hw_pass='' hw_domain='' hw_region=''
+  local hw_ak='' hw_sk='' hw_region='' staging=''
   [[ -f $CONFIG_FILE && ! -L $CONFIG_FILE ]] || return 1
   config_mode_is_private || return 1
   while IFS= read -r line || [[ -n $line ]]; do
@@ -212,21 +213,21 @@ load_config(){
         token_count=$((token_count + 1))
         token=$value
         ;;
-      HUAWEICLOUD_USERNAME)
-        hw_user_count=$((hw_user_count + 1))
-        hw_user=$value
+      HUAWEICLOUD_ACCESS_KEY_ID)
+        hw_ak_count=$((hw_ak_count + 1))
+        hw_ak=$value
         ;;
-      HUAWEICLOUD_PASSWORD)
-        hw_pass_count=$((hw_pass_count + 1))
-        hw_pass=$value
-        ;;
-      HUAWEICLOUD_DOMAINNAME)
-        hw_domain_count=$((hw_domain_count + 1))
-        hw_domain=$value
+      HUAWEICLOUD_SECRET_ACCESS_KEY)
+        hw_sk_count=$((hw_sk_count + 1))
+        hw_sk=$value
         ;;
       HUAWEICLOUD_REGION)
         hw_region_count=$((hw_region_count + 1))
         hw_region=$value
+        ;;
+      STAGING)
+        staging_count=$((staging_count + 1))
+        staging=$value
         ;;
       DOMAIN)
         domain_count=$((domain_count + 1))
@@ -240,19 +241,21 @@ load_config(){
     esac
   done < "$CONFIG_FILE"
   [[ $provider_count -le 1 && $account_count -le 1 && $token_count -le 1 &&
-     $hw_user_count -le 1 && $hw_pass_count -le 1 && $hw_domain_count -le 1 &&
-     $hw_region_count -le 1 && $domain_count -eq 1 && $wildcard_count -eq 1 ]] || return 1
+     $hw_ak_count -le 1 && $hw_sk_count -le 1 && $hw_region_count -le 1 &&
+     $staging_count -le 1 && $domain_count -eq 1 && $wildcard_count -eq 1 ]] || return 1
   provider=${provider:-cloudflare}
   valid_dns_provider "$provider" || return 1
   [[ $wildcard == 0 || $wildcard == 1 ]] || return 1
+  staging=${staging:-0}
+  [[ $staging == 0 || $staging == 1 ]] || return 1
   normalize_acme_domain "$domain" || return 1
   DNS_PROVIDER=$provider
   CF_ACCOUNT_ID=
   CF_TOKEN=
-  HUAWEICLOUD_USERNAME=
-  HUAWEICLOUD_PASSWORD=
-  HUAWEICLOUD_DOMAINNAME=
+  HUAWEICLOUD_ACCESS_KEY_ID=
+  HUAWEICLOUD_SECRET_ACCESS_KEY=
   HUAWEICLOUD_REGION=
+  STAGING=$staging
   if [[ $wildcard == 1 ]]; then
     ACME_WILDCARD_DOMAIN="*.$ACME_PRIMARY_DOMAIN"
   else
@@ -267,17 +270,14 @@ load_config(){
       CF_TOKEN=$token
       ;;
     huaweicloud)
-      [[ $hw_user_count -eq 1 && $hw_pass_count -eq 1 && $hw_domain_count -eq 1 ]] || return 1
-      [[ -n $hw_user && -n $hw_pass && -n $hw_domain ]] || return 1
-      if [[ $hw_region_count -eq 1 ]]; then
-        [[ $hw_region =~ ^[A-Za-z0-9_-]{2,32}$ ]] || return 1
-        HUAWEICLOUD_REGION=$hw_region
-      else
-        HUAWEICLOUD_REGION=ap-southeast-1
-      fi
-      HUAWEICLOUD_USERNAME=$hw_user
-      HUAWEICLOUD_PASSWORD=$hw_pass
-      HUAWEICLOUD_DOMAINNAME=$hw_domain
+      [[ $hw_ak_count -eq 1 && $hw_sk_count -eq 1 && $hw_region_count -eq 1 ]] || return 1
+      [[ -n $hw_ak && -n $hw_sk && -n $hw_region ]] || return 1
+      [[ $hw_ak =~ ^[A-Za-z0-9_-]{16,64}$ ]] || return 1
+      [[ $hw_sk =~ ^[A-Za-z0-9+/=_-]{16,128}$ ]] || return 1
+      [[ $hw_region =~ ^[A-Za-z0-9_-]{2,32}$ ]] || return 1
+      HUAWEICLOUD_ACCESS_KEY_ID=$hw_ak
+      HUAWEICLOUD_SECRET_ACCESS_KEY=$hw_sk
+      HUAWEICLOUD_REGION=$hw_region
       ;;
   esac
 }

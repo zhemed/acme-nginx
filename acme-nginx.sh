@@ -34,10 +34,10 @@ ACME_WILDCARD_DOMAIN=
 DNS_PROVIDER=cloudflare
 CF_ACCOUNT_ID=
 CF_TOKEN=
-HUAWEICLOUD_USERNAME=
-HUAWEICLOUD_PASSWORD=
-HUAWEICLOUD_DOMAINNAME=
+HUAWEICLOUD_ACCESS_KEY_ID=
+HUAWEICLOUD_SECRET_ACCESS_KEY=
 HUAWEICLOUD_REGION=
+STAGING=0
 
 red(){ echo -e "\033[31m\033[01m$1\033[0m";}
 green(){ echo -e "\033[32m\033[01m$1\033[0m";}
@@ -48,7 +48,7 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-acme_nginx_version="v0.2.0"
+acme_nginx_version="v0.3.0"
 
 valid_ipv4(){
   local ip=$1 IFS=. octets octet
@@ -167,13 +167,14 @@ write_config_template(){
     printf '%s\n' '# Account ID 为 32 位十六进制'
     printf '%s\n' 'CF_ACCOUNT_ID='
     printf '%s\n' 'CF_TOKEN='
-    printf '%s\n' '# --- 华为云凭据（DNS_PROVIDER=huaweicloud 时必填）---'
-    printf '%s\n' '# IAM 子账号用户名/密码，及华为云账号名（控制台“我的凭证”中查看）'
-    printf '%s\n' 'HUAWEICLOUD_USERNAME='
-    printf '%s\n' 'HUAWEICLOUD_PASSWORD='
-    printf '%s\n' 'HUAWEICLOUD_DOMAINNAME='
-    printf '%s\n' '# 可选，默认 ap-southeast-1；国内建议 cn-north-4'
+    printf '%s\n' '# --- 华为云凭据（DNS_PROVIDER=huaweicloud 时必填，AK/SK 模式）---'
+    printf '%s\n' '# AK/SK：控制台“我的凭证”→“访问密钥”中创建'
+    printf '%s\n' 'HUAWEICLOUD_ACCESS_KEY_ID='
+    printf '%s\n' 'HUAWEICLOUD_SECRET_ACCESS_KEY='
+    printf '%s\n' '# 区域（必填），国内建议 cn-north-4，如 cn-north-4/ap-southeast-1'
     printf '%s\n' 'HUAWEICLOUD_REGION='
+    printf '%s\n' '# 联调用 Let''s Encrypt 预演服务器：1 开启，生产保持 0'
+    printf '%s\n' 'STAGING=0'
     printf '%s\n' '# 主域名（必填）'
     printf '%s\n' 'DOMAIN='
     printf '%s\n' '# 是否同时申请泛域名证书：1 表示同时签 *.DOMAIN'
@@ -187,9 +188,9 @@ write_config_template(){
 load_config(){
   local line key value
   local provider_count=0 account_count=0 token_count=0 domain_count=0 wildcard_count=0
-  local hw_user_count=0 hw_pass_count=0 hw_domain_count=0 hw_region_count=0
+  local hw_ak_count=0 hw_sk_count=0 hw_region_count=0 staging_count=0
   local provider='' account='' token='' domain='' wildcard=''
-  local hw_user='' hw_pass='' hw_domain='' hw_region=''
+  local hw_ak='' hw_sk='' hw_region='' staging=''
   [[ -f $CONFIG_FILE && ! -L $CONFIG_FILE ]] || return 1
   config_mode_is_private || return 1
   while IFS= read -r line || [[ -n $line ]]; do
@@ -212,21 +213,21 @@ load_config(){
         token_count=$((token_count + 1))
         token=$value
         ;;
-      HUAWEICLOUD_USERNAME)
-        hw_user_count=$((hw_user_count + 1))
-        hw_user=$value
+      HUAWEICLOUD_ACCESS_KEY_ID)
+        hw_ak_count=$((hw_ak_count + 1))
+        hw_ak=$value
         ;;
-      HUAWEICLOUD_PASSWORD)
-        hw_pass_count=$((hw_pass_count + 1))
-        hw_pass=$value
-        ;;
-      HUAWEICLOUD_DOMAINNAME)
-        hw_domain_count=$((hw_domain_count + 1))
-        hw_domain=$value
+      HUAWEICLOUD_SECRET_ACCESS_KEY)
+        hw_sk_count=$((hw_sk_count + 1))
+        hw_sk=$value
         ;;
       HUAWEICLOUD_REGION)
         hw_region_count=$((hw_region_count + 1))
         hw_region=$value
+        ;;
+      STAGING)
+        staging_count=$((staging_count + 1))
+        staging=$value
         ;;
       DOMAIN)
         domain_count=$((domain_count + 1))
@@ -240,19 +241,21 @@ load_config(){
     esac
   done < "$CONFIG_FILE"
   [[ $provider_count -le 1 && $account_count -le 1 && $token_count -le 1 &&
-     $hw_user_count -le 1 && $hw_pass_count -le 1 && $hw_domain_count -le 1 &&
-     $hw_region_count -le 1 && $domain_count -eq 1 && $wildcard_count -eq 1 ]] || return 1
+     $hw_ak_count -le 1 && $hw_sk_count -le 1 && $hw_region_count -le 1 &&
+     $staging_count -le 1 && $domain_count -eq 1 && $wildcard_count -eq 1 ]] || return 1
   provider=${provider:-cloudflare}
   valid_dns_provider "$provider" || return 1
   [[ $wildcard == 0 || $wildcard == 1 ]] || return 1
+  staging=${staging:-0}
+  [[ $staging == 0 || $staging == 1 ]] || return 1
   normalize_acme_domain "$domain" || return 1
   DNS_PROVIDER=$provider
   CF_ACCOUNT_ID=
   CF_TOKEN=
-  HUAWEICLOUD_USERNAME=
-  HUAWEICLOUD_PASSWORD=
-  HUAWEICLOUD_DOMAINNAME=
+  HUAWEICLOUD_ACCESS_KEY_ID=
+  HUAWEICLOUD_SECRET_ACCESS_KEY=
   HUAWEICLOUD_REGION=
+  STAGING=$staging
   if [[ $wildcard == 1 ]]; then
     ACME_WILDCARD_DOMAIN="*.$ACME_PRIMARY_DOMAIN"
   else
@@ -267,17 +270,14 @@ load_config(){
       CF_TOKEN=$token
       ;;
     huaweicloud)
-      [[ $hw_user_count -eq 1 && $hw_pass_count -eq 1 && $hw_domain_count -eq 1 ]] || return 1
-      [[ -n $hw_user && -n $hw_pass && -n $hw_domain ]] || return 1
-      if [[ $hw_region_count -eq 1 ]]; then
-        [[ $hw_region =~ ^[A-Za-z0-9_-]{2,32}$ ]] || return 1
-        HUAWEICLOUD_REGION=$hw_region
-      else
-        HUAWEICLOUD_REGION=ap-southeast-1
-      fi
-      HUAWEICLOUD_USERNAME=$hw_user
-      HUAWEICLOUD_PASSWORD=$hw_pass
-      HUAWEICLOUD_DOMAINNAME=$hw_domain
+      [[ $hw_ak_count -eq 1 && $hw_sk_count -eq 1 && $hw_region_count -eq 1 ]] || return 1
+      [[ -n $hw_ak && -n $hw_sk && -n $hw_region ]] || return 1
+      [[ $hw_ak =~ ^[A-Za-z0-9_-]{16,64}$ ]] || return 1
+      [[ $hw_sk =~ ^[A-Za-z0-9+/=_-]{16,128}$ ]] || return 1
+      [[ $hw_region =~ ^[A-Za-z0-9_-]{2,32}$ ]] || return 1
+      HUAWEICLOUD_ACCESS_KEY_ID=$hw_ak
+      HUAWEICLOUD_SECRET_ACCESS_KEY=$hw_sk
+      HUAWEICLOUD_REGION=$hw_region
       ;;
   esac
 }
@@ -498,9 +498,8 @@ dns_provider_credentials_present(){
          $(grep -Ec "^SAVED_CF_Account_ID='[0-9A-Fa-f]{32}'$" "$account_conf" 2>/dev/null || true) -eq 1 ]]
       ;;
     huaweicloud)
-      [[ $(grep -Ec "^SAVED_HUAWEICLOUD_Username='[^']+'$" "$account_conf" 2>/dev/null || true) -eq 1 &&
-         $(grep -Ec "^SAVED_HUAWEICLOUD_Password='[^']+'$" "$account_conf" 2>/dev/null || true) -eq 1 &&
-         $(grep -Ec "^SAVED_HUAWEICLOUD_DomainName='[^']+'$" "$account_conf" 2>/dev/null || true) -eq 1 ]]
+      [[ $(grep -Ec "^SAVED_HUAWEICLOUD_ACCESS_KEY_ID='[^']+'$" "$account_conf" 2>/dev/null || true) -eq 1 &&
+         $(grep -Ec "^SAVED_HUAWEICLOUD_SECRET_ACCESS_KEY='[^']+'$" "$account_conf" 2>/dev/null || true) -eq 1 ]]
       ;;
     *) return 1 ;;
   esac
@@ -575,9 +574,193 @@ valid_dns_provider(){
 dns_provider_plugin_file(){
   case ${DNS_PROVIDER:-cloudflare} in
     cloudflare) printf '%s\n' 'dns_cf.sh' ;;
-    huaweicloud) printf '%s\n' 'dns_huaweicloud.sh' ;;
+    huaweicloud) printf '%s\n' 'dns_huaweicloud_aksk.sh' ;;
     *) return 1 ;;
   esac
+}
+
+write_huawei_aksk_plugin(){
+  local plugin plugin_tmp
+  plugin=$(dns_provider_plugin_file) || return 1
+  if [[ -f $ACME_HOME/dnsapi/$plugin && ! -L $ACME_HOME/dnsapi/$plugin ]] &&
+     huawei_aksk_plugin_ok; then
+    return 0
+  fi
+  plugin_tmp=$(mktemp "$ACME_HOME/.aksk-plugin.XXXXXX") || return 1
+  if ! cat > "$plugin_tmp" <<'HWAKSK'
+#!/bin/sh
+# acme-nginx-huaweicloud-aksk: v1
+# Custom Huawei Cloud DNS dnsapi plugin for acme.sh using AK/SK signing (DNS v2 API).
+# Requires: curl, openssl, jq. Uses acme.sh helpers when sourced.
+export LANG=en_US.UTF-8
+
+_hwak_sha256_hex(){
+  openssl dgst -sha256 -hex | sed 's/^.*= //'
+}
+
+_hwak_hmac_hex(){
+  openssl dgst -sha256 -hmac "$1" -binary | od -An -tx1 | tr -d ' \n'
+}
+
+_hwak_urlencode(){
+  printf '%s' "$1" | jq -sRr @uri
+}
+
+_hwak_canonical_query(){
+  printf '%s' "$1" | tr '&' '\n' | grep -v '^$' | sort | \
+    awk -F= '{ if (sep) printf "&"; printf "%s=%s", $1, $2; sep=1 }'
+}
+
+_hwak_sign(){
+  local method=$1 path=$2 query=$3 headers=$4 signed=$5 body=$6 sdk_date=$7
+  local payload_hash canonical string2sign signature
+  case $path in
+    */) ;;
+    *) path="$path/" ;;
+  esac
+  payload_hash=$(printf '%s' "$body" | _hwak_sha256_hex) || return 1
+  canonical=$(printf '%s\n%s\n%s\n%s\n%s\n%s' \
+    "$method" "$path" "$query" "$headers" "$signed" "$payload_hash") || return 1
+  string2sign=$(printf 'SDK-HMAC-SHA256\n%s\n%s' \
+    "$sdk_date" "$(printf '%s' "$canonical" | _hwak_sha256_hex)") || return 1
+  signature=$(printf '%s' "$string2sign" | _hwak_hmac_hex "$HUAWEICLOUD_SECRET_ACCESS_KEY") || return 1
+  printf 'SDK-HMAC-SHA256 Access=%s, SignedHeaders=%s, Signature=%s' \
+    "$HUAWEICLOUD_ACCESS_KEY_ID" "$signed" "$signature"
+}
+
+_hwak_request(){
+  local method=$1 path=$2 query=$3 body=$4
+  local sdk_date endpoint headers signed auth url code response out
+  [ -n "$HUAWEICLOUD_ACCESS_KEY_ID" ] || return 1
+  [ -n "$HUAWEICLOUD_SECRET_ACCESS_KEY" ] || return 1
+  [ -n "$HUAWEICLOUD_REGION" ] || return 1
+  sdk_date=$(date -u +%Y%m%dT%H%M%SZ) || return 1
+  endpoint="dns.$HUAWEICLOUD_REGION.myhuaweicloud.com"
+  headers=$(printf 'content-type:application/json\nhost:%s\nx-sdk-date:%s\n' "$endpoint" "$sdk_date")
+  signed='content-type;host;x-sdk-date'
+  auth=$(_hwak_sign "$method" "$path" "$query" "$headers" "$signed" "$body" "$sdk_date") || return 1
+  url="https://$endpoint$path"
+  [ -z "$query" ] || url="$url?$query"
+  out=$(mktemp "${TMPDIR:-/tmp}/hwak.XXXXXX") || return 1
+  if [ -n "$body" ]; then
+    code=$(curl -sS -o "$out" -w '%{http_code}' -X "$method" \
+      -H "Content-Type: application/json" -H "Host: $endpoint" \
+      -H "X-Sdk-Date: $sdk_date" -H "Authorization: $auth" \
+      --connect-timeout 10 --max-time 30 --data "$body" "$url" 2>/dev/null) || { rm -f "$out"; return 1; }
+  else
+    code=$(curl -sS -o "$out" -w '%{http_code}' -X "$method" \
+      -H "Content-Type: application/json" -H "Host: $endpoint" \
+      -H "X-Sdk-Date: $sdk_date" -H "Authorization: $auth" \
+      --connect-timeout 10 --max-time 30 "$url" 2>/dev/null) || { rm -f "$out"; return 1; }
+  fi
+  response=$(cat "$out" 2>/dev/null)
+  rm -f "$out"
+  case $code in
+    2??) ;;
+    *) _err "huaweicloud aksk: HTTP $code $response"; return 1 ;;
+  esac
+  printf '%s' "$response"
+}
+
+_hwak_find_zone(){
+  local fulldomain=$1 zone resp id
+  zone=$fulldomain
+  while :; do
+    case $zone in
+      *.*) zone=${zone#*.} ;;
+      *) break ;;
+    esac
+    resp=$(_hwak_request GET "/v2/zones" "type=public&name=$(_hwak_urlencode "$zone")" "") || return 1
+    id=$(printf '%s' "$resp" | jq -r --arg z "$zone" '.zones[]? | select(.name == ($z + ".")) | .id' | head -n 1)
+    [ -n "$id" ] || continue
+    printf '%s' "$id"
+    return 0
+  done
+  return 1
+}
+
+_hwak_find_recordset(){
+  local fulldomain=$1 resp
+  resp=$(_hwak_request GET "/v2/recordsets" "type=TXT&name=$(_hwak_urlencode "$fulldomain")" "") || return 1
+  printf '%s' "$resp" | jq -c --arg f "$fulldomain" '.recordsets[]? | select(.name == ($f + "."))'
+}
+
+_hwak_append_record(){
+  local zone_id=$1 fulldomain=$2 txtvalue=$3 rs=$4
+  local id records new_records_json body
+  id=$(printf '%s' "$rs" | jq -r '.id')
+  [ -n "$id" ] || return 1
+  records=$(printf '%s' "$rs" | jq -r '.records[]?')
+  new_records_json=$(printf '%s\n' "$records" | \
+    awk -v v="\"$txtvalue\"" 'BEGIN{found=0} {if ($0==v) found=1; else print} END{if (!found) print v}' | \
+    jq -Rsc 'split("\n") | map(select(length>0))')
+  body=$(jq -nc --arg name "$fulldomain." --argjson records "$new_records_json" \
+    '{name:$name, type:"TXT", ttl:300, records:$records}')
+  _hwak_request PUT "/v2/zones/$zone_id/recordsets/$id" "" "$body" >/dev/null || return 1
+}
+
+dns_huaweicloud_aksk_add(){
+  local fulldomain=$1 txtvalue=$2 zone_id rs body
+  HUAWEICLOUD_ACCESS_KEY_ID="${HUAWEICLOUD_ACCESS_KEY_ID:-$(_readaccountconf_mutable HUAWEICLOUD_ACCESS_KEY_ID)}"
+  HUAWEICLOUD_SECRET_ACCESS_KEY="${HUAWEICLOUD_SECRET_ACCESS_KEY:-$(_readaccountconf_mutable HUAWEICLOUD_SECRET_ACCESS_KEY)}"
+  HUAWEICLOUD_REGION="${HUAWEICLOUD_REGION:-$(_readaccountconf_mutable HUAWEICLOUD_REGION)}"
+  if [ -z "$HUAWEICLOUD_ACCESS_KEY_ID" ] || [ -z "$HUAWEICLOUD_SECRET_ACCESS_KEY" ] || [ -z "$HUAWEICLOUD_REGION" ]; then
+    _err "Not enough information provided to dns_huaweicloud_aksk!"
+    return 1
+  fi
+  _saveaccountconf_mutable HUAWEICLOUD_ACCESS_KEY_ID "$HUAWEICLOUD_ACCESS_KEY_ID"
+  _saveaccountconf_mutable HUAWEICLOUD_SECRET_ACCESS_KEY "$HUAWEICLOUD_SECRET_ACCESS_KEY"
+  _saveaccountconf_mutable HUAWEICLOUD_REGION "$HUAWEICLOUD_REGION"
+  zone_id=$(_hwak_find_zone "$fulldomain") || { _err "huaweicloud aksk: cannot find zone for $fulldomain"; return 1; }
+  rs=$(_hwak_find_recordset "$fulldomain") || return 1
+  if [ -z "$rs" ]; then
+    body=$(printf '{"name":"%s.","type":"TXT","ttl":300,"records":["\\"%s\\""]}' "$fulldomain" "$txtvalue")
+    _hwak_request POST "/v2/zones/$zone_id/recordsets" "" "$body" >/dev/null || return 1
+  else
+    _hwak_append_record "$zone_id" "$fulldomain" "$txtvalue" "$rs" || return 1
+  fi
+}
+
+dns_huaweicloud_aksk_rm(){
+  local fulldomain=$1 txtvalue=$2 zone_id rs id records new_records_json body
+  HUAWEICLOUD_ACCESS_KEY_ID="${HUAWEICLOUD_ACCESS_KEY_ID:-$(_readaccountconf_mutable HUAWEICLOUD_ACCESS_KEY_ID)}"
+  HUAWEICLOUD_SECRET_ACCESS_KEY="${HUAWEICLOUD_SECRET_ACCESS_KEY:-$(_readaccountconf_mutable HUAWEICLOUD_SECRET_ACCESS_KEY)}"
+  HUAWEICLOUD_REGION="${HUAWEICLOUD_REGION:-$(_readaccountconf_mutable HUAWEICLOUD_REGION)}"
+  [ -n "$HUAWEICLOUD_ACCESS_KEY_ID" ] && [ -n "$HUAWEICLOUD_SECRET_ACCESS_KEY" ] && [ -n "$HUAWEICLOUD_REGION" ] || return 1
+  zone_id=$(_hwak_find_zone "$fulldomain") || return 0
+  rs=$(_hwak_find_recordset "$fulldomain") || return 0
+  [ -n "$rs" ] || return 0
+  id=$(printf '%s' "$rs" | jq -r '.id')
+  [ -n "$id" ] || return 1
+  records=$(printf '%s' "$rs" | jq -r '.records[]?')
+  new_records_json=$(printf '%s\n' "$records" | awk -v v="\"$txtvalue\"" '$0 != v' | jq -Rsc 'split("\n") | map(select(length>0))')
+  if [ "$new_records_json" = "[]" ]; then
+    _hwak_request DELETE "/v2/zones/$zone_id/recordsets/$id" "" "" >/dev/null || return 1
+  else
+    body=$(jq -nc --arg name "$fulldomain." --argjson records "$new_records_json" \
+      '{name:$name, type:"TXT", ttl:300, records:$records}')
+    _hwak_request PUT "/v2/zones/$zone_id/recordsets/$id" "" "$body" >/dev/null || return 1
+  fi
+}
+HWAKSK
+  then
+    rm -f "$plugin_tmp"
+    return 1
+  fi
+  if ! chmod 700 "$plugin_tmp" || ! mv -fT -- "$plugin_tmp" "$ACME_HOME/dnsapi/$plugin"; then
+    rm -f "$plugin_tmp"
+    return 1
+  fi
+  huawei_aksk_plugin_ok
+}
+
+huawei_aksk_plugin_ok(){
+  local plugin count
+  plugin=$(dns_provider_plugin_file) || return 1
+  [[ -f $ACME_HOME/dnsapi/$plugin && ! -L $ACME_HOME/dnsapi/$plugin ]] || return 1
+  count=$(grep -Fxc -- '# acme-nginx-huaweicloud-aksk: v1' "$ACME_HOME/dnsapi/$plugin" 2>/dev/null || true)
+  [[ $count -eq 1 ]] || return 1
+  bash -n "$ACME_HOME/dnsapi/$plugin" >/dev/null 2>&1
 }
 
 install_official_acme(){
@@ -586,6 +769,9 @@ install_official_acme(){
   if [[ -x $ACME_BIN && -f $ACME_HOME/dnsapi/$plugin ]]; then
     installed_version=$(HOME="$STATE_DIR" "$ACME_BIN" --version 2>/dev/null)
     if printf '%s\n' "$installed_version" | grep -Fxq "v$ACME_VERSION"; then
+      if [[ ${DNS_PROVIDER:-cloudflare} == huaweicloud ]]; then
+        write_huawei_aksk_plugin || return 1
+      fi
       return 0
     fi
   fi
@@ -623,6 +809,9 @@ install_official_acme(){
     return 1
   fi
   chmod 700 "$ACME_HOME" "$ACME_BIN"
+  if [[ ${DNS_PROVIDER:-cloudflare} == huaweicloud ]]; then
+    write_huawei_aksk_plugin || return 1
+  fi
 }
 
 write_acme_reload_hook(){
@@ -1046,15 +1235,20 @@ issue_certificate(){
       [[ $CF_TOKEN =~ ^[A-Za-z0-9_-]{10,200}$ ]] || return 1
       ;;
     huaweicloud)
-      [[ -n ${HUAWEICLOUD_USERNAME:-} && -n ${HUAWEICLOUD_PASSWORD:-} &&
-         -n ${HUAWEICLOUD_DOMAINNAME:-} ]] || return 1
+      [[ -n ${HUAWEICLOUD_ACCESS_KEY_ID:-} && -n ${HUAWEICLOUD_SECRET_ACCESS_KEY:-} &&
+         -n ${HUAWEICLOUD_REGION:-} ]] || return 1
       ;;
   esac
   plugin=$(dns_provider_plugin_file) || return 1
   install_official_acme || return 1
   write_acme_reload_hook || return 1
-  issue_args=(--home "$ACME_HOME" --config-home "$ACME_HOME" --issue --server letsencrypt \
+  issue_args=(--home "$ACME_HOME" --config-home "$ACME_HOME" --issue \
     --dns "${plugin%.sh}" --keylength ec-256 -d "$ACME_PRIMARY_DOMAIN")
+  if [[ ${STAGING:-0} == 1 ]]; then
+    issue_args+=(--server https://acme-staging-v02.api.letsencrypt.org/directory)
+  else
+    issue_args+=(--server letsencrypt)
+  fi
   if [[ -n ${ACME_WILDCARD_DOMAIN:-} ]]; then
     issue_args+=(-d "$ACME_WILDCARD_DOMAIN")
     blue "将申请：$ACME_PRIMARY_DOMAIN + $ACME_WILDCARD_DOMAIN"
@@ -1071,10 +1265,9 @@ issue_certificate(){
       fi
       ;;
     huaweicloud)
-      if ! HOME="$STATE_DIR" HUAWEICLOUD_Username="$HUAWEICLOUD_USERNAME" \
-          HUAWEICLOUD_Password="$HUAWEICLOUD_PASSWORD" \
-          HUAWEICLOUD_DomainName="$HUAWEICLOUD_DOMAINNAME" \
-          HUAWEICLOUD_Region="${HUAWEICLOUD_REGION:-ap-southeast-1}" \
+      if ! HOME="$STATE_DIR" HUAWEICLOUD_ACCESS_KEY_ID="$HUAWEICLOUD_ACCESS_KEY_ID" \
+          HUAWEICLOUD_SECRET_ACCESS_KEY="$HUAWEICLOUD_SECRET_ACCESS_KEY" \
+          HUAWEICLOUD_REGION="$HUAWEICLOUD_REGION" \
           "$ACME_BIN" "${issue_args[@]}"; then
         red "华为云 DNS 验证或证书签发失败"
         return 1

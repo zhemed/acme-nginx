@@ -83,7 +83,7 @@ acme-nginx issue
 ```
 
 签发成功后会：
-- 以原子方式部署证书到 `/etc/acme-nginx/live`（generation 切换，失败自动回滚）。
+- 以原子方式部署证书到 `/etc/acme-nginx/acme-live`（generation 切换，失败自动回滚）。
 - 生成稳定引用路径 `/etc/acme-nginx/fullchain.pem` 与 `/etc/acme-nginx/privkey.pem`。
 - 安装 root crontab 自动续期任务（每天 03:17 / 09:17 / 15:17 / 21:17 检查）。
 - 如果 Nginx 正在运行，会自动 reload 使新证书生效。

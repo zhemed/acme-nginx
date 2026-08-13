@@ -63,7 +63,7 @@ export ACME_KEY="$STATE_DIR/privkey.pem"
 export ACME_STAGE="$ACME_HOME/stage"
 export ACME_STAGE_CERT="$ACME_STAGE/fullchain.pem"
 export ACME_STAGE_KEY="$ACME_STAGE/private.key"
-export ACME_LIVE="$STATE_DIR/live"
+export ACME_LIVE="$STATE_DIR/acme-live"
 export ACME_GENERATIONS="$ACME_LIVE/generations"
 export ACME_CURRENT="$ACME_LIVE/current"
 export ACME_LOCK="$STATE_DIR/acme.lock"
@@ -427,6 +427,23 @@ grep -Fq 'shellcheck disable=SC2317,SC2329' "$ACME_RELOAD" || fail "hook disable
 pass "hook nginx reload integration"
 bash -n "$ACME_RELOAD" || fail "hook passes bash -n"
 pass "hook passes bash -n"
+
+# --- managed live layout uses acme-live (matches generated deploy script) ---
+case $(uname -s 2>/dev/null) in
+  MINGW*|MSYS*)
+    pass "managed live layout is valid (skipped on Windows)"
+    ;;
+  *)
+    mkdir -p "$ACME_LIVE/generations"
+    gen_dir=$(mktemp -d "$ACME_LIVE/generations/gen.XXXXXX")
+    printf 'cert-placeholder' > "$gen_dir/fullchain.pem"
+    printf 'key-placeholder' > "$gen_dir/private.key"
+    ln -s "generations/${gen_dir##*/}" "$ACME_LIVE/current"
+    ln -s 'acme-live/current/fullchain.pem' "$ACME_CERT"
+    ln -s 'acme-live/current/private.key' "$ACME_KEY"
+    expect_success "managed live layout is valid" managed_acme_live_layout_is_valid
+    ;;
+esac
 printf '%s\n' '#!/bin/bash' > "$ACME_RELOAD"
 chmod 700 "$ACME_RELOAD"
 expect_failure "unversioned hook is stale" acme_reload_hook_is_current

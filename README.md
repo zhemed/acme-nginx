@@ -64,7 +64,7 @@ WILDCARD=1
 
 ## 固定路径
 
-- 状态目录：`/etc/acme-nginx`（acme.sh home、`live/generations`、`identity`、`reload.sh`、`renew.sh`、`renew.state`）
+- 状态目录：`/etc/acme-nginx`（acme.sh home、`acme-live/generations`、`identity`、`reload.sh`、`renew.sh`、`renew.state`）
 - 证书文件（Nginx 引用这两个稳定路径，自动指向当前生效 generation）：
   - `/etc/acme-nginx/fullchain.pem`
   - `/etc/acme-nginx/privkey.pem`

@@ -2003,7 +2003,11 @@ inspect_acme_renewal_health(){
 }
 
 cmd_status(){
-  local identity
+  local identity config_ok=1
+  if ! config_is_present || ! load_config 2>/dev/null; then
+    config_ok=0
+    yellow "配置文件缺失或无效：$CONFIG_FILE（自动续期状态可能不准确）"
+  fi
   if ! identity=$(read_acme_identity 2>/dev/null); then
     red "尚未找到 ACME 身份，证书可能未签发"
     return 1
@@ -2012,11 +2016,15 @@ cmd_status(){
   show_acme_certificate_schedule "$identity" || true
   printf 'Nginx 引用路径: %s / %s\n' "$ACME_CERT" "$ACME_KEY"
   printf '定时检查: 每天 03:17 / 09:17 / 15:17 / 21:17（服务器时间）\n'
-  inspect_acme_renewal_health
-  if [[ $ACME_RENEW_HEALTH == normal ]]; then
-    green "自动续期: 正常"
+  if [[ $config_ok -eq 1 ]]; then
+    inspect_acme_renewal_health
+    if [[ $ACME_RENEW_HEALTH == normal ]]; then
+      green "自动续期: 正常"
+    else
+      red "自动续期: 异常（$ACME_RENEW_HEALTH_DETAIL）"
+    fi
   else
-    red "自动续期: 异常（$ACME_RENEW_HEALTH_DETAIL）"
+    red "自动续期: 无法确认（配置文件缺失或无效）"
   fi
   if load_acme_renew_state; then
     printf '最近自动检查: %s\n' "$ACME_RENEW_LAST_CHECK"

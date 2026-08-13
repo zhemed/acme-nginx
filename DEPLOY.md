@@ -7,7 +7,7 @@
 - 一台 Linux 服务器，有 root 权限（或可 sudo）。
 - 已安装 Nginx（未安装时可在部署后自行安装：Debian/Ubuntu `apt install nginx`，CentOS `dnf install nginx`，Alpine `apk add nginx`）。
 - 目标域名已解析到本服务器 IP。
-- Cloudflare 账号：Account ID + API Token（Token 需要该域名所在 Zone 的 **Zone.Zone Read** 与 **Zone.DNS Edit** 权限）。
+- DNS 供应商凭据（二选一）：Cloudflare（Account ID + API Token，Token 需该域名 Zone 的 **Zone.Zone Read** 与 **Zone.DNS Edit** 权限）或华为云（IAM 子账号用户名/密码 + 华为云账号名）。
 - 服务器能访问 GitHub（安装固定版本 acme.sh 时需要）。
 
 ## 一、获取并安装 acme-nginx
@@ -48,14 +48,29 @@ vi /etc/acme-nginx.conf
 ```
 
 ```ini
+DNS_PROVIDER=cloudflare
 CF_ACCOUNT_ID=0123456789abcdef0123456789abcdef
 CF_TOKEN=你的CloudflareAPIToken
 DOMAIN=example.com
 WILDCARD=1        # 1 表示同时申请 *.example.com，0 只申请单域名
 ```
 
-- `CF_ACCOUNT_ID`：Cloudflare 账号 ID，32 位十六进制。
-- `CF_TOKEN`：Cloudflare API Token（Zone.DNS 编辑权限）。
+- `DNS_PROVIDER`：DNS 供应商，`cloudflare` 或 `huaweicloud`，默认 `cloudflare`。
+- Cloudflare 模式：`CF_ACCOUNT_ID`（32 位十六进制）+ `CF_TOKEN`（Zone.DNS 编辑权限）。
+- 华为云模式（域名 DNS 托管在华为云时）：
+
+```ini
+DNS_PROVIDER=huaweicloud
+HUAWEICLOUD_USERNAME=IAM子账号用户名
+HUAWEICLOUD_PASSWORD=子账号密码
+HUAWEICLOUD_DOMAINNAME=华为云账号名
+HUAWEICLOUD_REGION=cn-north-4    # 可选，默认 ap-southeast-1
+DOMAIN=example.com
+WILDCARD=1
+```
+
+  华为云凭据获取：控制台「统一身份认证」创建子账号（权限需包含 DNS 云解析），
+  「我的凭证」中查看账号名（DomainName）。
 - `DOMAIN`：主域名（必填）。
 - `WILDCARD`：可选，默认 0。
 
@@ -124,7 +139,7 @@ acme-nginx uninstall      # 卸载（移除 cron、证书、状态与配置）
 
 | 现象 | 处理 |
 | --- | --- |
-| `issue` 报 DNS 验证失败 | 检查 Cloudflare Token 是否有 Zone.DNS Edit 权限；域名是否托管在对应账号 |
+| `issue` 报 DNS 验证失败 | Cloudflare：检查 Token 是否有 Zone.DNS Edit 权限；华为云：检查 IAM 子账号权限与 `HUAWEICLOUD_REGION` 是否正确，域名是否托管在该供应商 |
 | `install` 报 acme.sh 下载失败 | 确认服务器可访问 GitHub，或临时设置代理后重试 |
 | `status` 显示自动续期异常 | 检查 `systemctl status cron`（或 `rc-service crond status`）是否运行 |
 | 证书已签发但 Nginx 未生效 | 手动 `nginx -t && systemctl reload nginx`，检查 server 块是否引用 `/etc/acme-nginx/fullchain.pem` |
@@ -132,6 +147,6 @@ acme-nginx uninstall      # 卸载（移除 cron、证书、状态与配置）
 
 ## 安全说明
 
-- `/etc/acme-nginx.conf` 含 Cloudflare Token，权限必须为 600（工具会校验并拒绝非 600 的配置）。
+- `/etc/acme-nginx.conf` 含 DNS 供应商凭据，权限必须为 600（工具会校验并拒绝非 600 的配置）。
 - 证书与私钥文件权限均为 600，目录 700。
 - 卸载时工具会移除配置与私钥，如仍需备份请先自行复制。

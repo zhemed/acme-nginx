@@ -138,9 +138,19 @@ write_config_template(){
   tmp=$(mktemp "$STATE_DIR/.acme-nginx.conf.XXXXXX") || return 1
   if ! {
     printf '%s\n' '# acme-nginx 配置文件'
-    printf '%s\n' '# Cloudflare API 凭据（Account ID 为 32 位十六进制）'
+    printf '%s\n' '# DNS 供应商：cloudflare 或 huaweicloud'
+    printf '%s\n' 'DNS_PROVIDER=cloudflare'
+    printf '%s\n' '# --- Cloudflare 凭据（DNS_PROVIDER=cloudflare 时必填）---'
+    printf '%s\n' '# Account ID 为 32 位十六进制'
     printf '%s\n' 'CF_ACCOUNT_ID='
     printf '%s\n' 'CF_TOKEN='
+    printf '%s\n' '# --- 华为云凭据（DNS_PROVIDER=huaweicloud 时必填）---'
+    printf '%s\n' '# IAM 子账号用户名/密码，及华为云账号名（控制台“我的凭证”中查看）'
+    printf '%s\n' 'HUAWEICLOUD_USERNAME='
+    printf '%s\n' 'HUAWEICLOUD_PASSWORD='
+    printf '%s\n' 'HUAWEICLOUD_DOMAINNAME='
+    printf '%s\n' '# 可选，默认 ap-southeast-1；国内建议 cn-north-4'
+    printf '%s\n' 'HUAWEICLOUD_REGION='
     printf '%s\n' '# 主域名（必填）'
     printf '%s\n' 'DOMAIN='
     printf '%s\n' '# 是否同时申请泛域名证书：1 表示同时签 *.DOMAIN'
@@ -153,8 +163,10 @@ write_config_template(){
 
 load_config(){
   local line key value
-  local account_count=0 token_count=0 domain_count=0 wildcard_count=0
-  local account='' token='' domain='' wildcard=''
+  local provider_count=0 account_count=0 token_count=0 domain_count=0 wildcard_count=0
+  local hw_user_count=0 hw_pass_count=0 hw_domain_count=0 hw_region_count=0
+  local provider='' account='' token='' domain='' wildcard=''
+  local hw_user='' hw_pass='' hw_domain='' hw_region=''
   [[ -f $CONFIG_FILE && ! -L $CONFIG_FILE ]] || return 1
   config_mode_is_private || return 1
   while IFS= read -r line || [[ -n $line ]]; do
@@ -163,8 +175,12 @@ load_config(){
     [[ $line == *=* ]] || return 1
     key=${line%%=*}
     value=${line#*=}
-    [[ -n $value && $value != *"'"* && $value != *$'\r'* ]] || return 1
+    [[ $value != *"'"* && $value != *$'\r'* ]] || return 1
     case $key in
+      DNS_PROVIDER)
+        provider_count=$((provider_count + 1))
+        provider=$value
+        ;;
       CF_ACCOUNT_ID)
         account_count=$((account_count + 1))
         account=$value
@@ -172,6 +188,22 @@ load_config(){
       CF_TOKEN)
         token_count=$((token_count + 1))
         token=$value
+        ;;
+      HUAWEICLOUD_USERNAME)
+        hw_user_count=$((hw_user_count + 1))
+        hw_user=$value
+        ;;
+      HUAWEICLOUD_PASSWORD)
+        hw_pass_count=$((hw_pass_count + 1))
+        hw_pass=$value
+        ;;
+      HUAWEICLOUD_DOMAINNAME)
+        hw_domain_count=$((hw_domain_count + 1))
+        hw_domain=$value
+        ;;
+      HUAWEICLOUD_REGION)
+        hw_region_count=$((hw_region_count + 1))
+        hw_region=$value
         ;;
       DOMAIN)
         domain_count=$((domain_count + 1))
@@ -184,81 +216,179 @@ load_config(){
       *) return 1 ;;
     esac
   done < "$CONFIG_FILE"
-  [[ $account_count -eq 1 && $token_count -eq 1 &&
-     $domain_count -eq 1 && $wildcard_count -eq 1 ]] || return 1
-  valid_cloudflare_account_id "$account" || return 1
-  [[ $token =~ ^[A-Za-z0-9_-]{10,200}$ ]] || return 1
+  [[ $provider_count -le 1 && $account_count -le 1 && $token_count -le 1 &&
+     $hw_user_count -le 1 && $hw_pass_count -le 1 && $hw_domain_count -le 1 &&
+     $hw_region_count -le 1 && $domain_count -eq 1 && $wildcard_count -eq 1 ]] || return 1
+  provider=${provider:-cloudflare}
+  valid_dns_provider "$provider" || return 1
   [[ $wildcard == 0 || $wildcard == 1 ]] || return 1
   normalize_acme_domain "$domain" || return 1
+  DNS_PROVIDER=$provider
+  CF_ACCOUNT_ID=
+  CF_TOKEN=
+  HUAWEICLOUD_USERNAME=
+  HUAWEICLOUD_PASSWORD=
+  HUAWEICLOUD_DOMAINNAME=
+  HUAWEICLOUD_REGION=
   if [[ $wildcard == 1 ]]; then
     ACME_WILDCARD_DOMAIN="*.$ACME_PRIMARY_DOMAIN"
   else
     ACME_WILDCARD_DOMAIN=
   fi
-  CF_ACCOUNT_ID=$account
-  CF_TOKEN=$token
+  case $provider in
+    cloudflare)
+      [[ $account_count -eq 1 && $token_count -eq 1 ]] || return 1
+      valid_cloudflare_account_id "$account" || return 1
+      [[ $token =~ ^[A-Za-z0-9_-]{10,200}$ ]] || return 1
+      CF_ACCOUNT_ID=$account
+      CF_TOKEN=$token
+      ;;
+    huaweicloud)
+      [[ $hw_user_count -eq 1 && $hw_pass_count -eq 1 && $hw_domain_count -eq 1 ]] || return 1
+      [[ -n $hw_user && -n $hw_pass && -n $hw_domain ]] || return 1
+      if [[ $hw_region_count -eq 1 ]]; then
+        [[ $hw_region =~ ^[A-Za-z0-9_-]{2,32}$ ]] || return 1
+        HUAWEICLOUD_REGION=$hw_region
+      else
+        HUAWEICLOUD_REGION=ap-southeast-1
+      fi
+      HUAWEICLOUD_USERNAME=$hw_user
+      HUAWEICLOUD_PASSWORD=$hw_pass
+      HUAWEICLOUD_DOMAINNAME=$hw_domain
+      ;;
+  esac
 }
 # --- config parsing ---
 write_config_fixture(){
-  local wildcard=${1:-0}
+  local provider=${1:-cloudflare} wildcard=${2:-0}
   mkdir -p "$STATE_DIR"
   cat > "$CONFIG_FILE" <<EOF
+DNS_PROVIDER=$provider
 CF_ACCOUNT_ID=0123456789abcdef0123456789abcdef
 CF_TOKEN=AbCdEfGhIjKlMnOpQrStUvWxYz0123456789
+HUAWEICLOUD_USERNAME=acme-iam-user
+HUAWEICLOUD_PASSWORD=hw-secret-password
+HUAWEICLOUD_DOMAINNAME=hw-account
+HUAWEICLOUD_REGION=cn-north-4
 DOMAIN=example.com
 WILDCARD=$wildcard
 EOF
   chmod 600 "$CONFIG_FILE"
 }
 
-write_config_fixture 0
+write_config_fixture cloudflare 0
 expect_success "valid config is loaded" load_config
 [[ $CF_ACCOUNT_ID == 0123456789abcdef0123456789abcdef &&
    $CF_TOKEN == AbCdEfGhIjKlMnOpQrStUvWxYz0123456789 &&
+   $DNS_PROVIDER == cloudflare &&
    $ACME_PRIMARY_DOMAIN == example.com && -z $ACME_WILDCARD_DOMAIN ]] ||
   fail "valid config values"
 pass "valid config values"
 
-write_config_fixture 1
+write_config_fixture cloudflare 1
 expect_success "wildcard config is loaded" load_config
 [[ $ACME_WILDCARD_DOMAIN == '*.example.com' ]] || fail "wildcard config value"
 pass "wildcard config value"
 
 sed -i '/^DOMAIN=/d' "$CONFIG_FILE"
 expect_failure "missing DOMAIN key is rejected" load_config
-write_config_fixture 0
+write_config_fixture cloudflare 0
 printf '%s\n' 'DOMAIN=other.com' >> "$CONFIG_FILE"
 expect_failure "duplicate DOMAIN key is rejected" load_config
-write_config_fixture 0
+write_config_fixture cloudflare 0
 sed -i 's/CF_ACCOUNT_ID=0123456789abcdef0123456789abcdef/CF_ACCOUNT_ID=short/' "$CONFIG_FILE"
 expect_failure "short Account ID is rejected" load_config
-write_config_fixture 0
+write_config_fixture cloudflare 0
 sed -i 's/CF_TOKEN=AbCdEfGhIjKlMnOpQrStUvWxYz0123456789/CF_TOKEN=short/' "$CONFIG_FILE"
 expect_failure "short Cloudflare token is rejected" load_config
-write_config_fixture 2
+write_config_fixture cloudflare 2
 expect_failure "invalid WILDCARD value is rejected" load_config
-write_config_fixture 0
+write_config_fixture cloudflare 0
 printf '%s\n' 'UNKNOWN_KEY=1' >> "$CONFIG_FILE"
 expect_failure "unknown config key is rejected" load_config
-write_config_fixture 0
+write_config_fixture cloudflare 0
 chmod 644 "$CONFIG_FILE"
 case $(uname -s 2>/dev/null) in
   MINGW*|MSYS*) ;;
   *) expect_failure "world-readable config is rejected" load_config ;;
 esac
 
+# --- DNS provider validation ---
+write_config_fixture cloudflare 0
+expect_success "default provider is cloudflare" load_config
+[[ $DNS_PROVIDER == cloudflare ]] || fail "default provider value"
+pass "default provider value"
+
+sed -i '/^DNS_PROVIDER=/d' "$CONFIG_FILE"
+expect_success "legacy config without DNS_PROVIDER loads as cloudflare" load_config
+[[ $DNS_PROVIDER == cloudflare ]] || fail "legacy provider value"
+pass "legacy provider value"
+
+write_config_fixture cloudflare 0
+sed -i 's/^DNS_PROVIDER=cloudflare/DNS_PROVIDER=huawei/' "$CONFIG_FILE"
+expect_failure "unknown DNS_PROVIDER is rejected" load_config
+write_config_fixture cloudflare 0
+printf '%s\n' 'DNS_PROVIDER=huaweicloud' >> "$CONFIG_FILE"
+expect_failure "duplicate DNS_PROVIDER is rejected" load_config
+
+write_config_fixture huaweicloud 0
+expect_success "huaweicloud config is loaded" load_config
+[[ $DNS_PROVIDER == huaweicloud &&
+   $HUAWEICLOUD_USERNAME == acme-iam-user &&
+   $HUAWEICLOUD_PASSWORD == hw-secret-password &&
+   $HUAWEICLOUD_DOMAINNAME == hw-account &&
+   $HUAWEICLOUD_REGION == cn-north-4 &&
+   $ACME_PRIMARY_DOMAIN == example.com ]] || fail "huaweicloud config values"
+pass "huaweicloud config values"
+
+write_config_fixture huaweicloud 0
+sed -i '/^HUAWEICLOUD_USERNAME=/d' "$CONFIG_FILE"
+expect_failure "huaweicloud missing username is rejected" load_config
+write_config_fixture huaweicloud 0
+sed -i 's/^HUAWEICLOUD_USERNAME=acme-iam-user/HUAWEICLOUD_USERNAME=/' "$CONFIG_FILE"
+expect_failure "huaweicloud empty username is rejected" load_config
+write_config_fixture huaweicloud 0
+sed -i 's/^HUAWEICLOUD_REGION=cn-north-4/HUAWEICLOUD_REGION=bad_region!/' "$CONFIG_FILE"
+expect_failure "huaweicloud invalid region is rejected" load_config
+write_config_fixture huaweicloud 0
+sed -i '/^HUAWEICLOUD_REGION=/d' "$CONFIG_FILE"
+expect_success "huaweicloud without region defaults" load_config
+[[ $HUAWEICLOUD_REGION == ap-southeast-1 ]] || fail "huaweicloud default region"
+pass "huaweicloud default region"
+
+expect_success "cloudflare provider is valid" valid_dns_provider cloudflare
+expect_success "huaweicloud provider is valid" valid_dns_provider huaweicloud
+expect_failure "unknown provider is invalid" valid_dns_provider huawei
+expect_failure "empty provider is invalid" valid_dns_provider ''
+
+export DNS_PROVIDER=cloudflare
 # --- Cloudflare credentials in acme.sh account.conf ---
 mkdir -p "$ACME_HOME"
 cat > "$ACME_HOME/account.conf" <<'EOF'
 SAVED_CF_Token='AbCdEfGhIjKlMnOpQrStUvWxYz0123456789'
 SAVED_CF_Account_ID='0123456789abcdef0123456789abcdef'
 EOF
-expect_success "stored Cloudflare credentials are present" cloudflare_acme_credentials_present
+expect_success "stored Cloudflare credentials are present" dns_provider_credentials_present
 rm -f "$ACME_HOME/account.conf"
-expect_failure "missing stored Cloudflare credentials are absent" cloudflare_acme_credentials_present
+expect_failure "missing stored Cloudflare credentials are absent" dns_provider_credentials_present
 printf '%s\n' "SAVED_CF_Token='bad'" > "$ACME_HOME/account.conf"
-expect_failure "malformed stored Cloudflare credentials are rejected" cloudflare_acme_credentials_present
+expect_failure "malformed stored Cloudflare credentials are rejected" dns_provider_credentials_present
 rm -f "$ACME_HOME/account.conf"
+
+# --- Huawei Cloud credentials in acme.sh account.conf ---
+export DNS_PROVIDER=huaweicloud
+cat > "$ACME_HOME/account.conf" <<'EOF'
+SAVED_HUAWEICLOUD_Username='acme-iam-user'
+SAVED_HUAWEICLOUD_Password='hw-secret-password'
+SAVED_HUAWEICLOUD_DomainName='hw-account'
+EOF
+expect_success "stored Huawei Cloud credentials are present" dns_provider_credentials_present
+rm -f "$ACME_HOME/account.conf"
+expect_failure "missing stored Huawei Cloud credentials are absent" dns_provider_credentials_present
+printf '%s\n' "SAVED_HUAWEICLOUD_Username='acme-iam-user'" > "$ACME_HOME/account.conf"
+expect_failure "incomplete stored Huawei Cloud credentials are rejected" dns_provider_credentials_present
+rm -f "$ACME_HOME/account.conf"
+export DNS_PROVIDER=cloudflare
 
 # --- identity roundtrip ---
 expect_success "identity is written" write_acme_identity example.com

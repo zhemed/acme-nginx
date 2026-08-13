@@ -24,10 +24,10 @@ cmd_install(){
   if ! config_is_present; then
     write_config_template || { red "生成配置模板失败"; return 1; }
     yellow "已生成配置模板：$CONFIG_FILE"
-    yellow "请填写 CF_ACCOUNT_ID、CF_TOKEN、DOMAIN（WILDCARD 可选）后运行 acme-nginx issue"
+    yellow "请填写 DNS_PROVIDER、DOMAIN 与对应供应商凭据后运行 acme-nginx issue"
   else
     load_config || { red "配置文件格式或权限异常：$CONFIG_FILE"; return 1; }
-    blue "配置文件校验通过：主域名 $ACME_PRIMARY_DOMAIN"
+    blue "配置文件校验通过：供应商 ${DNS_PROVIDER:-cloudflare}，主域名 $ACME_PRIMARY_DOMAIN"
     [[ -n $ACME_WILDCARD_DOMAIN ]] && blue "同时申请泛域名：$ACME_WILDCARD_DOMAIN"
   fi
   install_official_acme || return 1
@@ -51,7 +51,7 @@ cmd_issue(){
     yellow "已存在有效证书（$identity），无需重复签发；如需重签请运行 acme-nginx force-renew"
     return 0
   fi
-  if ! with_acme_lock issue_cloudflare_certificate; then
+  if ! with_acme_lock issue_certificate; then
     return 1
   fi
   if ! with_acme_lock setup_acme_renew_cron; then
@@ -136,12 +136,14 @@ inspect_acme_renewal_health(){
   local current state now identity reference_epoch
   ACME_RENEW_HEALTH=normal
   ACME_RENEW_HEALTH_DETAIL=正常
-  if [[ ! -x $ACME_BIN || ! -f $ACME_HOME/dnsapi/dns_cf.sh || ! -s $ACME_IDENTITY ]]; then
+  local plugin
+  if ! plugin=$(dns_provider_plugin_file) ||
+     [[ ! -x $ACME_BIN || ! -f $ACME_HOME/dnsapi/$plugin || ! -s $ACME_IDENTITY ]]; then
     ACME_RENEW_HEALTH=error
     ACME_RENEW_HEALTH_DETAIL="acme.sh 组件不完整"
-  elif ! cloudflare_acme_credentials_present; then
+  elif ! dns_provider_credentials_present; then
     ACME_RENEW_HEALTH=error
-    ACME_RENEW_HEALTH_DETAIL="Cloudflare 凭据缺失或格式异常"
+    ACME_RENEW_HEALTH_DETAIL="DNS 供应商凭据缺失或格式异常"
   elif ! identity=$(read_acme_identity 2>/dev/null); then
     ACME_RENEW_HEALTH=error
     ACME_RENEW_HEALTH_DETAIL="ACME 身份文件损坏"

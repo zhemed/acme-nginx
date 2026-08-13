@@ -1,5 +1,5 @@
 # acme-nginx-module: 10-acme
-# Certificate functions (Cloudflare DNS-01 + atomic generation deployment)
+# Certificate functions (DNS-01 + atomic generation deployment)
 certificate_san_text(){
   local cert=$1
   if openssl x509 -help 2>&1 | grep -q -- '-ext'; then
@@ -206,12 +206,21 @@ load_acme_certificate_schedule(){
   fi
 }
 
-cloudflare_acme_credentials_present(){
-  local account_conf="$ACME_HOME/account.conf" token_count account_count
+dns_provider_credentials_present(){
+  local account_conf="$ACME_HOME/account.conf"
   [[ -f $account_conf && ! -L $account_conf ]] || return 1
-  token_count=$(grep -Ec "^SAVED_CF_Token='[A-Za-z0-9_-]+'$" "$account_conf" 2>/dev/null || true)
-  account_count=$(grep -Ec "^SAVED_CF_Account_ID='[0-9A-Fa-f]{32}'$" "$account_conf" 2>/dev/null || true)
-  [[ $token_count -eq 1 && $account_count -eq 1 ]]
+  case ${DNS_PROVIDER:-cloudflare} in
+    cloudflare)
+      [[ $(grep -Ec "^SAVED_CF_Token='[A-Za-z0-9_-]+'$" "$account_conf" 2>/dev/null || true) -eq 1 &&
+         $(grep -Ec "^SAVED_CF_Account_ID='[0-9A-Fa-f]{32}'$" "$account_conf" 2>/dev/null || true) -eq 1 ]]
+      ;;
+    huaweicloud)
+      [[ $(grep -Ec "^SAVED_HUAWEICLOUD_Username='[^']+'$" "$account_conf" 2>/dev/null || true) -eq 1 &&
+         $(grep -Ec "^SAVED_HUAWEICLOUD_Password='[^']+'$" "$account_conf" 2>/dev/null || true) -eq 1 &&
+         $(grep -Ec "^SAVED_HUAWEICLOUD_DomainName='[^']+'$" "$account_conf" 2>/dev/null || true) -eq 1 ]]
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 read_acme_identity(){
@@ -276,9 +285,22 @@ valid_cloudflare_account_id(){
   [[ $1 =~ ^[0-9A-Fa-f]{32}$ ]]
 }
 
+valid_dns_provider(){
+  [[ $1 == cloudflare || $1 == huaweicloud ]]
+}
+
+dns_provider_plugin_file(){
+  case ${DNS_PROVIDER:-cloudflare} in
+    cloudflare) printf '%s\n' 'dns_cf.sh' ;;
+    huaweicloud) printf '%s\n' 'dns_huaweicloud.sh' ;;
+    *) return 1 ;;
+  esac
+}
+
 install_official_acme(){
-  local temp_dir archive source_dir actual_sha256 installed_version
-  if [[ -x $ACME_BIN && -f $ACME_HOME/dnsapi/dns_cf.sh ]]; then
+  local temp_dir archive source_dir actual_sha256 installed_version plugin
+  plugin=$(dns_provider_plugin_file) || return 1
+  if [[ -x $ACME_BIN && -f $ACME_HOME/dnsapi/$plugin ]]; then
     installed_version=$(HOME="$STATE_DIR" "$ACME_BIN" --version 2>/dev/null)
     if printf '%s\n' "$installed_version" | grep -Fxq "v$ACME_VERSION"; then
       return 0
@@ -302,7 +324,7 @@ install_official_acme(){
     return 1
   fi
   if ! tar -xzf "$archive" -C "$temp_dir" || [[ ! -f $source_dir/acme.sh ]] || \
-     [[ ! -f $source_dir/dnsapi/dns_cf.sh ]] || \
+     [[ ! -f $source_dir/dnsapi/$plugin ]] || \
      ! (cd "$source_dir" && HOME="$STATE_DIR" bash ./acme.sh --install \
        --home "$ACME_HOME" --config-home "$ACME_HOME" --cert-home "$ACME_HOME/certs" \
        --no-cron --no-profile); then
@@ -312,7 +334,7 @@ install_official_acme(){
   fi
   rm -rf "$temp_dir"
   installed_version=$(HOME="$STATE_DIR" "$ACME_BIN" --version 2>/dev/null)
-  if [[ ! -x $ACME_BIN || ! -f $ACME_HOME/dnsapi/dns_cf.sh ]] || \
+  if [[ ! -x $ACME_BIN || ! -f $ACME_HOME/dnsapi/$plugin ]] || \
      ! printf '%s\n' "$installed_version" | grep -Fxq "v$ACME_VERSION"; then
     red "官方 acme.sh 安装不完整"
     return 1
@@ -687,8 +709,9 @@ prepare_acme_deploy_stage(){
 }
 
 valid_acme_renewal_identity(){
-  local identity
-  [[ -x $ACME_BIN && -f $ACME_HOME/dnsapi/dns_cf.sh ]] || return 1
+  local identity plugin
+  plugin=$(dns_provider_plugin_file) || return 1
+  [[ -x $ACME_BIN && -f $ACME_HOME/dnsapi/$plugin ]] || return 1
   identity=$(read_acme_identity 2>/dev/null) || return 1
   if ! load_certificate_metadata "$ACME_CERT" "$ACME_KEY" ||
      [[ $CERT_META_STATE != valid ]] ||
@@ -727,27 +750,54 @@ register_acme_certificate_deployment(){
     certificate_identity_matches "$ACME_CERT" "$identity"
 }
 
-issue_cloudflare_certificate(){
+issue_certificate(){
   local -a issue_args
-  [[ -n ${CF_TOKEN:-} && -n ${CF_ACCOUNT_ID:-} && -n ${ACME_PRIMARY_DOMAIN:-} ]] || return 1
-  valid_cloudflare_account_id "$CF_ACCOUNT_ID" || return 1
-  [[ $CF_TOKEN =~ ^[A-Za-z0-9_-]{10,200}$ ]] || return 1
+  local provider plugin
+  provider=${DNS_PROVIDER:-cloudflare}
+  [[ -n ${ACME_PRIMARY_DOMAIN:-} ]] || return 1
+  valid_dns_provider "$provider" || return 1
+  case $provider in
+    cloudflare)
+      [[ -n ${CF_TOKEN:-} && -n ${CF_ACCOUNT_ID:-} ]] || return 1
+      valid_cloudflare_account_id "$CF_ACCOUNT_ID" || return 1
+      [[ $CF_TOKEN =~ ^[A-Za-z0-9_-]{10,200}$ ]] || return 1
+      ;;
+    huaweicloud)
+      [[ -n ${HUAWEICLOUD_USERNAME:-} && -n ${HUAWEICLOUD_PASSWORD:-} &&
+         -n ${HUAWEICLOUD_DOMAINNAME:-} ]] || return 1
+      ;;
+  esac
+  plugin=$(dns_provider_plugin_file) || return 1
   install_official_acme || return 1
   write_acme_reload_hook || return 1
   issue_args=(--home "$ACME_HOME" --config-home "$ACME_HOME" --issue --server letsencrypt \
-    --dns dns_cf --keylength ec-256 -d "$ACME_PRIMARY_DOMAIN")
+    --dns "${plugin%.sh}" --keylength ec-256 -d "$ACME_PRIMARY_DOMAIN")
   if [[ -n ${ACME_WILDCARD_DOMAIN:-} ]]; then
     issue_args+=(-d "$ACME_WILDCARD_DOMAIN")
     blue "将申请：$ACME_PRIMARY_DOMAIN + $ACME_WILDCARD_DOMAIN"
   else
     blue "将申请单域名证书：$ACME_PRIMARY_DOMAIN"
   fi
-  if ! HOME="$STATE_DIR" CF_Token="$CF_TOKEN" CF_Account_ID="$CF_ACCOUNT_ID" \
-      CF_Zone_ID='' CF_Key='' CF_Email='' \
-      "$ACME_BIN" "${issue_args[@]}"; then
-    red "Cloudflare DNS 验证或证书签发失败"
-    return 1
-  fi
+  case $provider in
+    cloudflare)
+      if ! HOME="$STATE_DIR" CF_Token="$CF_TOKEN" CF_Account_ID="$CF_ACCOUNT_ID" \
+          CF_Zone_ID='' CF_Key='' CF_Email='' \
+          "$ACME_BIN" "${issue_args[@]}"; then
+        red "Cloudflare DNS 验证或证书签发失败"
+        return 1
+      fi
+      ;;
+    huaweicloud)
+      if ! HOME="$STATE_DIR" HUAWEICLOUD_Username="$HUAWEICLOUD_USERNAME" \
+          HUAWEICLOUD_Password="$HUAWEICLOUD_PASSWORD" \
+          HUAWEICLOUD_DomainName="$HUAWEICLOUD_DOMAINNAME" \
+          HUAWEICLOUD_Region="${HUAWEICLOUD_REGION:-ap-southeast-1}" \
+          "$ACME_BIN" "${issue_args[@]}"; then
+        red "华为云 DNS 验证或证书签发失败"
+        return 1
+      fi
+      ;;
+  esac
   if ! write_acme_identity "$ACME_PRIMARY_DOMAIN"; then
     red "写入 ACME 身份失败"
     return 1
@@ -756,7 +806,7 @@ issue_cloudflare_certificate(){
     red "证书签发成功，但部署到 $STATE_DIR 失败"
     return 1
   fi
-  green "Cloudflare DNS API 证书申请完成"
+  green "DNS API 证书申请完成（${provider}）"
 }
 
 show_certificate_metadata(){

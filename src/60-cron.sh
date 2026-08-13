@@ -411,7 +411,7 @@ setup_acme_renew_cron(){
       return 1
     }
   fi
-  cloudflare_acme_credentials_present || return 1
+  dns_provider_credentials_present || return 1
   write_acme_reload_hook || return 1
   if ! managed_acme_live_layout_is_valid ||
      ! acme_deployment_config_is_current "$identity"; then

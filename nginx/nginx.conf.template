@@ -1,0 +1,113 @@
+# ======================================================================
+# nginx 主配置模板：全局设置 + 站点配置（站点内联在同一文件内）
+#
+#   用法：替换 <domain> 与 <port> 后放到 /etc/nginx/nginx.conf（先备份原文件）
+#   证书：acme-nginx 签发的 Let's Encrypt 证书，稳定路径 /etc/acme-nginx/{fullchain,privkey}.pem
+#   备份：cp -a /etc/nginx/nginx.conf /root/nginx.conf.bak-$(date +%F-%H%M%S)
+#   流程：候选写 /tmp → nginx -t -c <候选> 预校验 → 落地 → 真实 nginx -t → systemctl reload nginx
+#
+#   设计要点：反代默认值放在 http 层共享一次，各站点 location 只写 proxy_pass；
+#             末尾有 default_server 兜底，未匹配的域名直接断开。
+# ======================================================================
+
+# Debian/Ubuntu 上是 www-data；RHEL 系或官方源通常是 nginx —— 按发行版改。
+user  www-data;
+worker_processes auto;
+pid /run/nginx.pid;
+
+events {
+	worker_connections 768;
+}
+
+http {
+	# ---- 基础 ----
+	sendfile on;
+	tcp_nopush on;
+	types_hash_max_size 2048;
+	server_tokens off;
+
+	# ---- MIME 与默认类型 ----
+	include /etc/nginx/mime.types;
+	default_type application/octet-stream;
+
+	# ---- TLS 默认值（站点块可覆盖）----
+	ssl_protocols TLSv1.2 TLSv1.3;
+	ssl_prefer_server_ciphers on;
+
+	# ---- 日志 ----
+	access_log /var/log/nginx/access.log;
+	error_log /var/log/nginx/error.log;
+
+	# ---- 压缩 ----
+	# 只压 nginx 自己下发的文本；流式接口（SSE）不宜压缩，故不追加 gzip_types。
+	gzip on;
+
+	# ---- 反代默认值（所有站点共用；站点可在 location 里覆盖）----
+	# ⚠️ proxy_set_header 不合并、只继承：某个 server/location 里只要出现哪怕一条 proxy_set_header，
+	#    上层（这里 http 层）的那一组就整体不再继承、只发该层自己写的 —— 要自定义就得把 6 条一并重写。
+	proxy_http_version 1.1;
+	proxy_set_header Upgrade    $http_upgrade;
+	proxy_set_header Connection $connection_upgrade;
+	proxy_set_header Host              $host;
+	proxy_set_header X-Real-IP         $remote_addr;
+	proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+	proxy_set_header X-Forwarded-Proto $scheme;
+	proxy_buffering         off;
+	proxy_request_buffering off;
+	proxy_read_timeout      3600s;
+	proxy_send_timeout      3600s;
+	client_max_body_size    100m;
+	# proxy_cache 默认即 off（未定义 cache zone），无需显式声明
+
+	# ===== 站点配置 =====
+	# 结构：一份 map（http 级共用）+ 每站点两个 server 块（80 跳转 / 443 TLS+反代）
+	# 加站点：复制一组 server 块，改 server_name 与 proxy_pass 端口 → nginx -t && systemctl reload nginx
+	map $http_upgrade $connection_upgrade {
+	    default upgrade;
+	    ''      "";
+	}
+
+	# ===== 站点：<name> → 127.0.0.1:<port> =====
+	server {
+	    listen      80;
+	    listen      [::]:80;
+	    server_name <domain>;
+	    return 301 https://$host$request_uri;
+	}
+
+	server {
+	    listen      443 ssl http2;
+	    listen      [::]:443 ssl http2;
+	    server_name <domain>;
+
+	    # 证书来自 acme-nginx 稳定路径：续期后自动切换，无需改本文件
+	    ssl_protocols       TLSv1.2 TLSv1.3;
+	    ssl_certificate     /etc/acme-nginx/fullchain.pem;
+	    ssl_certificate_key /etc/acme-nginx/privkey.pem;
+
+	    location / {
+	        proxy_pass http://127.0.0.1:<port>;
+	    }
+	}
+
+	# ---- 兜底：未匹配以上任何 server_name 的请求直接断开，不返回内容 ----
+	server {
+	    listen      80 default_server;
+	    listen      [::]:80 default_server;
+	    server_name _;
+	    return 444;
+	}
+
+	server {
+	    listen      443 ssl http2 default_server;
+	    listen      [::]:443 ssl http2 default_server;
+	    server_name _;
+
+	    # 兜底块同样需要证书，否则未匹配 SNI 时 TLS 握手无法完成
+	    ssl_protocols       TLSv1.2 TLSv1.3;
+	    ssl_certificate     /etc/acme-nginx/fullchain.pem;
+	    ssl_certificate_key /etc/acme-nginx/privkey.pem;
+
+	    return 444;
+	}
+}

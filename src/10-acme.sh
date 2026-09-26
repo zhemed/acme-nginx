@@ -23,6 +23,29 @@ certificate_identity_matches(){
   fi
 }
 
+certificate_covers_domains(){
+  local cert=$1; shift
+  local have want
+  have=$(certificate_dns_names "$cert" 2>/dev/null) || return 1
+  have=",${have// /},"
+  have=${have,,}
+  for want in "$@"; do
+    [[ -n $want ]] || continue
+    want=${want,,}
+    [[ $have == *",$want,"* ]] || return 1
+  done
+  return 0
+}
+
+certificate_covers_configured_domains(){
+  local cert=$1
+  local -a want=()
+  [[ -n ${ACME_PRIMARY_DOMAIN:-} ]] || return 1
+  want+=("$ACME_PRIMARY_DOMAIN")
+  [[ -n ${ACME_WILDCARD_DOMAIN:-} ]] && want+=("$ACME_WILDCARD_DOMAIN")
+  certificate_covers_domains "$cert" "${want[@]}"
+}
+
 certificate_time_valid(){
   local cert=$1 not_before not_before_epoch now
   openssl x509 -in "$cert" -noout -checkend 0 >/dev/null 2>&1 || return 1
@@ -985,10 +1008,14 @@ issue_certificate(){
      current_identity=$(read_acme_identity 2>/dev/null) &&
      load_certificate_metadata "$ACME_CERT" "$ACME_KEY" 2>/dev/null &&
      [[ $CERT_META_STATE == valid ]] &&
-     certificate_identity_matches "$ACME_CERT" "$current_identity" &&
-     ! load_acme_certificate_schedule "$current_identity" 2>/dev/null; then
-    issue_args+=(--force)
-    yellow "检测到已有证书但签发机构与当前配置不一致，将强制重新签发"
+     certificate_identity_matches "$ACME_CERT" "$current_identity"; then
+    if ! certificate_covers_configured_domains "$ACME_CERT"; then
+      issue_args+=(--force)
+      yellow "检测到当前证书未覆盖配置要求的域名（主域名/泛域名已变更），将强制重新签发"
+    elif ! load_acme_certificate_schedule "$current_identity" 2>/dev/null; then
+      issue_args+=(--force)
+      yellow "检测到已有证书但签发机构与当前配置不一致，将强制重新签发"
+    fi
   fi
   if [[ -n ${ACME_WILDCARD_DOMAIN:-} ]]; then
     issue_args+=(-d "$ACME_WILDCARD_DOMAIN")

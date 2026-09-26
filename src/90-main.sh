@@ -48,9 +48,15 @@ cmd_issue(){
      load_certificate_metadata "$ACME_CERT" "$ACME_KEY" 2>/dev/null &&
      [[ $CERT_META_STATE == valid ]] &&
      certificate_identity_matches "$ACME_CERT" "$identity" &&
+     certificate_covers_configured_domains "$ACME_CERT" &&
      load_acme_certificate_schedule "$identity" 2>/dev/null; then
     yellow "已存在有效证书（$identity），无需重复签发；如需重签请运行 acme-nginx force-renew"
     return 0
+  fi
+  if load_certificate_metadata "$ACME_CERT" "$ACME_KEY" 2>/dev/null &&
+     [[ $CERT_META_STATE == valid ]] &&
+     ! certificate_covers_configured_domains "$ACME_CERT"; then
+    yellow "当前证书未覆盖配置要求的域名（主域名/泛域名已变更），将重新签发"
   fi
   if ! with_acme_lock issue_certificate; then
     return 1
@@ -110,6 +116,24 @@ cmd_force_renew(){
     return 1
   fi
   prepare_state_dir || { red "初始化状态目录失败：$STATE_DIR"; return 1; }
+  if load_certificate_metadata "$ACME_CERT" "$ACME_KEY" 2>/dev/null &&
+     [[ $CERT_META_STATE == valid ]] &&
+     ! certificate_covers_configured_domains "$ACME_CERT"; then
+    yellow "当前证书未覆盖配置要求的域名（主域名/泛域名已变更），改用完整签发流程"
+    if ! with_acme_lock issue_certificate; then
+      red "重新签发失败，请查看上方 acme.sh 输出"
+      return 1
+    fi
+    if ! with_acme_lock setup_acme_renew_cron; then
+      yellow "证书已签发，但自动续期任务设置失败，请检查 root crontab 与 cron 服务"
+    fi
+    if nginx_running; then
+      green "证书已重新签发，nginx 已通过回调 reload 并加载新证书"
+    else
+      yellow "证书已重新签发；nginx 当前未运行，下次启动时会加载新证书"
+    fi
+    return 0
+  fi
   if ! with_acme_lock setup_acme_renew_cron; then
     red "自动续期组件修复失败，无法执行强制重签"
     return 1

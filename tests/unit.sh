@@ -533,6 +533,51 @@ expect_failure "certificate identity mismatch is rejected" certificate_identity_
 expect_success "certificate key matches" certificate_key_matches \
   "$CERT_DIR/cert.pem" "$CERT_DIR/key.pem"
 
+# --- configured-domain coverage: guards issue/force-renew against SAN drift ---
+WILD_CERT_DIR="$TEMP_DIR/cert-wild"
+mkdir -p "$WILD_CERT_DIR"
+(
+  cd "$WILD_CERT_DIR" || exit 1
+  openssl ecparam -genkey -name prime256v1 -out key.pem 2>/dev/null
+  MSYS2_ARG_CONV_EXCL='*' openssl req -new -x509 -days 90 -key key.pem -out cert.pem \
+    -subj '/CN=example.com' \
+    -addext 'subjectAltName=DNS:example.com,DNS:*.example.com' 2>/dev/null
+)
+chmod 600 "$WILD_CERT_DIR/key.pem" "$WILD_CERT_DIR/cert.pem"
+
+saved_primary_domain=${ACME_PRIMARY_DOMAIN-}
+saved_wildcard_domain=${ACME_WILDCARD_DOMAIN-}
+ACME_PRIMARY_DOMAIN=example.com
+ACME_WILDCARD_DOMAIN=
+expect_success "certificate covers single-domain config" certificate_covers_configured_domains \
+  "$CERT_DIR/cert.pem"
+ACME_PRIMARY_DOMAIN=other.com
+expect_failure "certificate missing configured primary domain is rejected" \
+  certificate_covers_configured_domains "$CERT_DIR/cert.pem"
+ACME_PRIMARY_DOMAIN=example.com
+ACME_WILDCARD_DOMAIN='*.example.com'
+expect_failure "single-domain certificate does not satisfy wildcard config" \
+  certificate_covers_configured_domains "$CERT_DIR/cert.pem"
+expect_success "wildcard certificate satisfies wildcard config" \
+  certificate_covers_configured_domains "$WILD_CERT_DIR/cert.pem"
+ACME_WILDCARD_DOMAIN=
+expect_success "wildcard certificate still satisfies single-domain config" \
+  certificate_covers_configured_domains "$WILD_CERT_DIR/cert.pem"
+ACME_PRIMARY_DOMAIN=
+expect_failure "unconfigured primary domain is rejected" certificate_covers_configured_domains \
+  "$CERT_DIR/cert.pem"
+ACME_PRIMARY_DOMAIN=$saved_primary_domain
+ACME_WILDCARD_DOMAIN=$saved_wildcard_domain
+
+expect_success "exact domain list is covered" certificate_covers_domains \
+  "$CERT_DIR/cert.pem" example.com www.example.com
+expect_failure "missing domain in list is rejected" certificate_covers_domains \
+  "$CERT_DIR/cert.pem" example.com api.example.com
+expect_success "domain match is case-insensitive" certificate_covers_domains \
+  "$CERT_DIR/cert.pem" EXAMPLE.com
+expect_failure "non-certificate path is rejected" certificate_covers_domains \
+  "$CERT_DIR/missing.pem" example.com
+
 # --- ACME schedule accepts staging API in staging mode, production otherwise ---
 SCHEDULE_DIR="$ACME_HOME/certs/cs.miio.cc_ecc"
 mkdir -p "$SCHEDULE_DIR"

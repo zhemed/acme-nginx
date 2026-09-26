@@ -31,6 +31,24 @@ sudo acme-nginx status         # 查看证书与续期状态
 sudo acme-nginx uninstall      # 卸载（移除 cron、证书、状态与配置）
 ```
 
+### 修改域名配置之后（`DOMAIN` / `WILDCARD`）
+
+`issue` 与 `force-renew` 都会检查**当前证书的 SAN 是否覆盖配置要求的域名集合**
+（主域名，以及 `WILDCARD=1` 时的泛域名）：
+
+- **覆盖**：`issue` 跳过（已存在有效证书），`force-renew` 按原身份强制续期；
+- **不覆盖**（例如把 `WILDCARD` 由 `0` 改成 `1`、或改了 `DOMAIN`）：
+  自动改走完整签发流程并强制重新签发 —— **不需要手工删除状态文件或 acme.sh 目录**。
+
+```
+$ sudo acme-nginx issue
+当前证书未覆盖配置要求的域名（主域名/泛域名已变更），将重新签发
+将申请：example.com + *.example.com
+```
+
+> 自动续期（cron）按 acme.sh **已存储的证书身份**续期，不会感知配置变化；
+> 改完域名配置请执行一次 `issue` 或 `force-renew`，之后的续期才会沿用新的域名集合。
+
 ## 配置文件 `/etc/acme-nginx.conf`（root-only 0600）
 
 ```ini

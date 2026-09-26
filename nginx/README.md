@@ -31,7 +31,29 @@ nginx -t && systemctl reload nginx
 （同名 `map` 重复定义不会报错，两个站点同时生效）。若不想重复，也可以按 nginx 惯用法把 `map`
 提到 `nginx.conf` 的 http 块里只留一份，再删掉各站点文件里的那段。
 
-## 路径二：片段 include（多站点复用）
+## 路径二：全部内联进 `nginx.conf`（文件最少）
+
+适合**站点数量少、要求 `/etc/nginx` 文件数最少**的机器：站点块直接住在 `nginx.conf` 的 `http {}` 里，
+不要独立站点文件、也不要 include。最终 `/etc/nginx` 只剩两个文件 —— `nginx.conf` 与 `mime.types`。
+
+```bash
+# 1. 取模板并替换占位符（<domain>、<port>），得到一份完整站点内容
+sed -e 's/<domain>/example.com/g' -e 's/<port>/8080/g' site-template.conf
+
+# 2. 把 map 之后的部分（两组 server 块）粘进 nginx.conf 的 http {} 内；
+#    map 只保留一份（首个站点带来的那份），后续加站点不要再粘 map
+
+# 3. 先预校验再落地（见下方"改 nginx.conf 的三段式"），然后
+nginx -t && systemctl reload nginx
+```
+
+**代价（务必知道）**：`nginx.conf` 是**发行版管理的 conffile** ——
+`dpkg-query -W -f='${Conffiles}' nginx-common` 里能看到它记录的原始 md5，你改过之后包升级就会走
+conffile 流程（提示 / `--force-confold` / `--force-confnew`）。**若某次升级采用了发行版版本，
+内联在里面的站点块会一起消失**：改前先备份，升级后核对站点是否还在。
+（这个风险不是内联独有的：只要站点靠 `nginx.conf` 里的 include 加载，包版本一旦落地同样加载不到站点。）
+
+## 路径三：片段 include（多站点复用）
 
 适合允许 `conf.d/` 与 `snippets/` 目录、想多站点零重复的机器。
 
@@ -82,6 +104,26 @@ diff <(norm < proxy-stream-common.conf | sort) \
 ```
 
 两条都无输出即为同步；有输出说明出现了漂移，按输出补齐。
+
+**内联布局（路径二）下的比对**：没有独立站点文件，改成从 `nginx.conf` 里截出对应片段比对
+（下面两条命令曾在真机上原样跑过，并跑过负例确认能报出差异）：
+
+```bash
+# C1. map 段：模板 vs nginx.conf（内联时 map 只有一份）
+diff <(sed -e 's/<domain>/example.com/g' -e 's/<port>/8080/g' site-template.conf | norm | sed -n '/^map /,/^}$/p') \
+     <(norm < /etc/nginx/nginx.conf | sed -n '/^map /,/^}$/p')
+
+# C2. 某个站点的两组 server 块：模板 vs nginx.conf 里该站点的块
+#     （靠站点分隔注释定位；站点名与域名换成你自己的）
+diff <(sed -e 's/<domain>/example.com/g' -e 's/<port>/8080/g' site-template.conf | norm | sed -n '/^server {/,$p') \
+     <(sed -n '/# ===== 站点：example.com/,/# ===== 站点/p' /etc/nginx/nginx.conf | norm | sed -n '/^server {/,$p')
+```
+
+> **改 `nginx.conf` 的三段式**（尤其是内联布局，一处写错会让所有站点一起 reload 不成功）：
+> ① 把候选配置写到 `/tmp`，用 `nginx -t -c /tmp/<候选>` **预校验**（线上配置零风险）；
+> ② 安装后跑**真实 `nginx -t`**，失败立即用备份还原；③ 通过才 `reload`。
+> **注意**：别写成 `if nginx -t | sed …; then` —— `if` 判的是管道最后一个命令的退出码，
+> 会把失败当成功，进而继续执行 `reload` 这类危险动作。
 
 > **为什么 B 忽略行序**：这些指令（`proxy_*`、`client_max_body_size`）彼此独立，行序不影响 nginx 行为
 > —— 片段与模板目前就只差 `proxy_cache off;` 与 `proxy_request_buffering off;` 的先后。

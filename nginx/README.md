@@ -27,6 +27,10 @@ nginx -t && systemctl reload nginx
 > `nginx.conf` 以 `include` 引入 http 块；塞进 `server`/`location` 会直接报错。
 > 占位符没替换就使用会导致 `nginx -t` 报错（有意如此，避免静默生效）。
 
+**多站点**：每个站点文件**各自带一份**同名 `map` 是可行的 —— 实测 nginx 1.18 下 `nginx -t` 通过
+（同名 `map` 重复定义不会报错，两个站点同时生效）。若不想重复，也可以按 nginx 惯用法把 `map`
+提到 `nginx.conf` 的 http 块里只留一份，再删掉各站点文件里的那段。
+
 ## 路径二：片段 include（多站点复用）
 
 适合允许 `conf.d/` 与 `snippets/` 目录、想多站点零重复的机器。

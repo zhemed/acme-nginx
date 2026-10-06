@@ -118,6 +118,30 @@ nginx -t && systemctl reload nginx        # systemd
 nginx -t && rc-service nginx reload       # OpenRC (Alpine)
 ```
 
+### 用仓库自带模板生成（推荐）
+
+仓库内自带一份经过生产验证的 `nginx/nginx.conf.template`：全局段 + **http 层共享的反代默认值** +
+`default_server` 兜底（未匹配域名直接 `return 444`）+ TLS 只留 1.2/1.3。用它生成并落地：
+
+```bash
+# 1) 生成（--domain/--port 换成你的值；生成到文件并预校验）
+scripts/new-nginx-conf.sh --domain example.com --port 8080 --out /tmp/nginx.conf.new --check
+
+# 2) 备份现有配置（带时间戳目录，便于回滚）
+mkdir -p /etc/nginx/backup/$(date -u +%Y%m%d%H%M%S)
+cp -a /etc/nginx/nginx.conf /etc/nginx/backup/<ts>/
+
+# 3) 落地 → 真实校验 → 生效
+cp -a /tmp/nginx.conf.new /etc/nginx/nginx.conf
+nginx -t && systemctl reload nginx
+```
+
+- **多站点**：复制整个 `server` 块（80 跳转 + 443 ssl 两份），只换 `<domain>` 与 `<port>`。
+  因为反代默认值已在 `http` 层共享，站点 `location` 里**只写 `proxy_pass`**，不必重复 `proxy_set_header`。
+- **证书**：由本仓库工具签发，稳定路径 `/etc/acme-nginx/{fullchain,privkey}.pem`（见「三、填写配置」「四、首次签发」）。
+- **续期后必须 `systemctl reload nginx`**：本工具续期成功会自动 reload；若你另有续期方式，请确认这一步存在，否则新证书不生效。
+- **回滚**：`cp -a /etc/nginx/backup/<ts>/nginx.conf /etc/nginx/nginx.conf && systemctl reload nginx`。
+
 ## 六、验证
 
 ```bash

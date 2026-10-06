@@ -3,8 +3,13 @@
 #
 #   用法：替换 <domain> 与 <port> 后放到 /etc/nginx/nginx.conf（先备份原文件）
 #   证书：acme-nginx 签发的 Let's Encrypt 证书，稳定路径 /etc/acme-nginx/{fullchain,privkey}.pem
-#   备份：cp -a /etc/nginx/nginx.conf /root/nginx.conf.bak-$(date +%F-%H%M%S)
+#   备份：改动前先建快照 —— mkdir -p /etc/nginx/backup/$(date -u +%Y%m%d%H%M%S) &&
+#                              cp -a /etc/nginx/nginx.conf /etc/nginx/backup/<ts>/
+#         回滚 —— cp -a /etc/nginx/backup/<ts>/nginx.conf /etc/nginx/nginx.conf && systemctl reload nginx
 #   流程：候选写 /tmp → nginx -t -c <候选> 预校验 → 落地 → 真实 nginx -t → systemctl reload nginx
+#   续期：acme-nginx 定时续期后**必须** `systemctl reload nginx`，否则新证书不会生效
+#   新增站点：复制整个 server 块（80 跳转 + 443 ssl 两份），替换 <domain> 与 <port> 即可；
+#             反代默认值已在 http 层共享，站点 location 里只写 proxy_pass。
 #
 #   设计要点：反代默认值放在 http 层共享一次，各站点 location 只写 proxy_pass；
 #             末尾有 default_server 兜底，未匹配的域名直接断开。

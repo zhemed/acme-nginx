@@ -14,6 +14,26 @@
 一次把形态定死，**不用每台机器重新排查**：`/etc/nginx` 最终只有两个文件
 （`nginx.conf` + `mime.types`，零多余目录），反代默认值在 http 层共享一次，末尾有 `default_server` 兜底。
 
+### 一键落地（推荐，`--install`）
+
+把「生成 → 整目录备份 → 替换 → **清理发行版默认残留** → `nginx -t` → reload」一次做完：
+
+```bash
+sudo scripts/new-nginx-conf.sh --domain example.com --port 8080 --install
+```
+
+- 会清掉发行版自带、而**新配置并未引用**的那批东西（新机 `apt install nginx` 之后的固定噪音）：
+  目录 `sites-available/ sites-enabled/ snippets/ conf.d/ modules-available/ modules-enabled/`，
+  文件 `fastcgi.conf fastcgi_params scgi_params uwsgi_params proxy_params koi-utf koi-win win-utf`。
+  模板只 `include mime.types`，这些文件对运行**没有任何作用**，删掉只是让 `/etc/nginx` 回到干净的 2 文件形态。
+- **安全闸门**：落地前先自检渲染结果 —— 只要它引用了上述任一路径，立即中止，一个文件都不改、也不产生备份。
+- 备份 `/root/nginx-etc-backup-<UTC 时间戳>.tar.gz`；
+  回滚 `tar xzf <备份> -C /etc && nginx -t && systemctl reload nginx`。
+- **演练**（假根，完全不碰真机）：`scripts/new-nginx-conf.sh --domain example.com --port 8080 --install --root /tmp/fake-root`。
+- 只想生成不落地：去掉 `--install`，按下面的手工三段式走。
+
+### 手工三段式（不想用 `--install` 时）
+
 ```bash
 # 1. 备份现有主配置
 cp -a /etc/nginx/nginx.conf /root/nginx.conf.bak-$(date +%F-%H%M%S)

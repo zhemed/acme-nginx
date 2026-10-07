@@ -121,7 +121,23 @@ nginx -t && rc-service nginx reload       # OpenRC (Alpine)
 ### 用仓库自带模板生成（推荐）
 
 仓库内自带一份经过生产验证的 `nginx/nginx.conf.template`：全局段 + **http 层共享的反代默认值** +
-`default_server` 兜底（未匹配域名直接 `return 444`）+ TLS 只留 1.2/1.3。用它生成并落地：
+`default_server` 兜底（未匹配域名直接 `return 444`）+ TLS 只留 1.2/1.3。
+
+**一键落地（推荐）**：`--install` 把「生成 → 整目录备份 → 替换 → **清理发行版默认残留** →
+`nginx -t` → reload」一次做完：
+
+```bash
+sudo scripts/new-nginx-conf.sh --domain example.com --port 8080 --install
+```
+
+- 新机 `apt install nginx` 之后 `/etc/nginx` 会带一堆发行版默认文件（`sites-enabled/`、`conf.d/`、
+  `snippets/`、`fastcgi*`、`koi-*` …）；本模板并不引用它们，`--install` 一并清掉 ——
+  目录直接回到「`nginx.conf` + `mime.types`」的干净形态，**不必每次部署都手工删**。
+- 落地前有自检：渲染结果一旦引用上述路径就立即中止（不改配置、也不留备份）。
+- 演练不碰真机：加 `--root /tmp/fake-root`。
+- 回滚：`tar xzf /root/nginx-etc-backup-<ts>.tar.gz -C /etc && nginx -t && systemctl reload nginx`。
+
+**手工三段式（等价，不想用 `--install` 时）**：
 
 ```bash
 # 1) 生成（--domain/--port 换成你的值；生成到文件并预校验）

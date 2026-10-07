@@ -98,10 +98,18 @@ if command -v shellcheck >/dev/null 2>&1; then
   shellcheck --shell=bash --severity=info "$ROOT_DIR/acme-nginx.sh"
   shellcheck --shell=bash --severity=info "$hook_candidate"
   shellcheck --shell=bash --severity=info \
-    "$ROOT_DIR/scripts/build.sh" "$ROOT_DIR/tests/unit.sh" "$ROOT_DIR/tests/verify.sh"
+    "$ROOT_DIR/scripts/build.sh" "$ROOT_DIR/scripts/new-nginx-conf.sh" \
+    "$ROOT_DIR/tests/unit.sh" "$ROOT_DIR/tests/verify.sh"
 else
   printf 'verify: shellcheck not found; static lint skipped\n' >&2
 fi
+
+for pattern in '--install' 'nginx-etc-backup-' 'sites-enabled' 'modules-enabled'; do
+  grep -Fq -- "$pattern" "$ROOT_DIR/scripts/new-nginx-conf.sh" ||
+    fail "new-nginx-conf.sh is missing the distro-leftover cleanup behavior: $pattern"
+done
+grep -Fq -- '--install' "$ROOT_DIR/DEPLOY.md" || fail "DEPLOY.md does not document --install"
+grep -Fq -- '--install' "$ROOT_DIR/nginx/README.md" || fail "nginx/README.md does not document --install"
 
 bash "$ROOT_DIR/tests/unit.sh"
 

@@ -733,3 +733,52 @@ for module in "$ROOT_DIR"/src/*.sh; do
     fail "module marker missing in ${module##*/}"
 done
 pass "source module markers present"
+
+# --- scripts/new-nginx-conf.sh：--install 一键落地（假根演练，不碰真机） ---
+fake_root="$TEMP_DIR/nginx-install-root"
+mkdir -p "$fake_root/etc/nginx"/{sites-enabled,sites-available,snippets,conf.d,modules-available,modules-enabled} "$fake_root/root"
+printf '%s\n' 'user www-data;' > "$fake_root/etc/nginx/nginx.conf"
+printf '%s\n' 'mime' > "$fake_root/etc/nginx/mime.types"
+for legacy in fastcgi.conf fastcgi_params scgi_params uwsgi_params proxy_params koi-utf koi-win win-utf; do
+  printf '%s\n' 'x' > "$fake_root/etc/nginx/$legacy"
+done
+printf '%s\n' 'x' > "$fake_root/etc/nginx/sites-enabled/default"
+printf '%s\n' 'x' > "$fake_root/etc/nginx/snippets/fastcgi-php.conf"
+printf '%s\n' 'x' > "$fake_root/etc/nginx/modules-enabled/50-module.conf"
+[[ $(find "$fake_root/etc/nginx" -maxdepth 1 -type f | wc -l) -eq 10 ]] || fail "fake root fixture"
+
+expect_success "install renders and tidies distro leftovers in a fake root" \
+  bash "$ROOT_DIR/scripts/new-nginx-conf.sh" --domain example.com --port 8080 --install --root "$fake_root"
+
+grep -Fq 'server_name example.com;' "$fake_root/etc/nginx/nginx.conf" || fail "rendered server_name"
+grep -Fq 'proxy_pass http://127.0.0.1:8080;' "$fake_root/etc/nginx/nginx.conf" || fail "rendered proxy_pass"
+[[ $(find "$fake_root/etc/nginx" -maxdepth 1 -type f | wc -l) -eq 2 ]] || fail "top-level files after install is not 2"
+[[ -f "$fake_root/etc/nginx/mime.types" ]] || fail "mime.types must be kept"
+for legacy in sites-enabled sites-available snippets conf.d modules-available modules-enabled; do
+  [[ ! -e "$fake_root/etc/nginx/$legacy" ]] || fail "legacy dir remains: $legacy"
+done
+for legacy in fastcgi.conf fastcgi_params scgi_params uwsgi_params proxy_params koi-utf koi-win win-utf; do
+  [[ ! -e "$fake_root/etc/nginx/$legacy" ]] || fail "legacy file remains: $legacy"
+done
+compgen -G "$fake_root/root/nginx-etc-backup-*.tar.gz" >/dev/null || fail "backup tarball missing"
+pass "install tidy result"
+
+expect_success "install is idempotent" \
+  bash "$ROOT_DIR/scripts/new-nginx-conf.sh" --domain example.com --port 8080 --install --root "$fake_root"
+[[ $(find "$fake_root/etc/nginx" -maxdepth 1 -type f | wc -l) -eq 2 ]] || fail "idempotent run changed the file count"
+pass "install idempotence"
+
+# 自检闸门：渲染结果一旦引用发行版路径，必须在改动任何文件之前中止（不改配置、不留备份）
+guard_repo="$TEMP_DIR/nginx-guard-repo"
+mkdir -p "$guard_repo/scripts" "$guard_repo/nginx" "$guard_repo/etc/nginx"
+cp "$ROOT_DIR/scripts/new-nginx-conf.sh" "$guard_repo/scripts/"
+cp "$ROOT_DIR/nginx/nginx.conf.template" "$guard_repo/nginx/"
+printf '%s\n' 'include /etc/nginx/sites-enabled/*;' >> "$guard_repo/nginx/nginx.conf.template"
+printf '%s\n' 'PRESERVE-ME' > "$guard_repo/etc/nginx/nginx.conf"
+expect_failure "install aborts when the rendered conf references distro paths" \
+  bash "$guard_repo/scripts/new-nginx-conf.sh" --domain example.com --port 8080 --install --root "$guard_repo"
+grep -Fq 'PRESERVE-ME' "$guard_repo/etc/nginx/nginx.conf" || fail "guarded abort must leave the existing conf untouched"
+if compgen -G "$guard_repo/root/nginx-etc-backup-*.tar.gz" >/dev/null; then
+  fail "guarded abort must not create a backup"
+fi
+pass "install self-check guard"

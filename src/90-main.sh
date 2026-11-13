@@ -32,6 +32,7 @@ cmd_install(){
   fi
   install_official_acme || return 1
   green "acme.sh v${ACME_VERSION} 安装完成"
+  ensure_sb_restart_post_hook || true
 }
 
 cmd_issue(){
@@ -47,6 +48,7 @@ cmd_issue(){
   if store_mode; then
     if store_certificate_is_adoptable; then
       adopt_store_certificate || return 1
+      ensure_sb_restart_post_hook || true
       return 0
     fi
     store_owner_value=$(store_owner 2>/dev/null || true)
@@ -73,6 +75,7 @@ cmd_issue(){
   if ! with_acme_lock issue_certificate; then
     return 1
   fi
+  ensure_sb_restart_post_hook || true
   if ! with_acme_lock setup_acme_renew_cron; then
     yellow "证书已签发，但自动续期任务设置失败，请检查 root crontab 与 cron 服务"
   else

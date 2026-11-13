@@ -50,7 +50,7 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-acme_nginx_version="v0.4.2"
+acme_nginx_version="v0.5.0"
 
 valid_ipv4(){
   local ip=$1 IFS=. octets octet
@@ -154,6 +154,16 @@ config_is_present(){
   config_mode_is_private
 }
 
+default_cert_source(){
+  local root
+  root=${STORE_DIR:-/etc/cert-store}
+  if compgen -G "$root"/*/current/fullchain.pem >/dev/null 2>&1; then
+    printf '%s\n' store
+  else
+    printf '%s\n' own
+  fi
+}
+
 write_config_template(){
   if [[ -e $CONFIG_FILE || -L $CONFIG_FILE ]]; then
     [[ -f $CONFIG_FILE && ! -L $CONFIG_FILE ]] || return 1
@@ -182,7 +192,7 @@ write_config_template(){
     printf '%s\n' '# 是否同时申请泛域名证书：1（默认）同时签 *.DOMAIN；0 只申请单域名'
     printf '%s\n' 'WILDCARD=1'
     printf '%s\n' '# 证书来源：own=本工具签发；store=领养 /etc/cert-store 共享证书库（与 sb 共用）'
-    printf '%s\n' 'CERT_SOURCE=own'
+    printf 'CERT_SOURCE=%s\n' "$(default_cert_source)"
     printf '%s\n' '# 共享证书库目录（CERT_SOURCE=store 时使用）'
     printf '%s\n' 'STORE_DIR=/etc/cert-store'
   } > "$tmp" || ! chmod 600 "$tmp" || ! mv -fT -- "$tmp" "$CONFIG_FILE"; then

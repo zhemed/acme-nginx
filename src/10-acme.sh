@@ -1163,6 +1163,22 @@ adopt_store_certificate(){
   return 0
 }
 
+# 检测到本机 sb 服务时，自动创建证书部署后的重启钩子（不覆盖已有自定义钩子）。
+ensure_sb_restart_post_hook(){
+  local hook="$STATE_DIR/post_reload.sh" tmp
+  [[ -e $hook || -L $hook ]] && return 0
+  command -v systemctl >/dev/null 2>&1 || return 0
+  [[ -d /run/systemd/system ]] || return 0
+  systemctl cat sb >/dev/null 2>&1 || return 0
+  tmp=$(mktemp "$STATE_DIR/.post_reload.XXXXXX") || return 1
+  if ! printf '%s\n' '#!/bin/bash' '# acme-nginx-managed sb restart hook (auto-created)' \
+       'systemctl restart sb' > "$tmp" ||
+     ! chmod 700 "$tmp" || ! mv -fT -- "$tmp" "$hook"; then
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
 issue_certificate(){
   local -a issue_args
   local provider plugin current_identity

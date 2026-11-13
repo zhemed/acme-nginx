@@ -86,6 +86,15 @@ tmp=$(mktemp "${TMPDIR:-/tmp}/new-nginx-conf.XXXXXX")
 trap 'rm -f -- "$tmp"' EXIT
 sed -e "s/<domain>/$domain/g" -e "s/<port>/$port/g" "$TEMPLATE" > "$tmp"
 
+# 共享证书库存在该域名的证书时，自动改用库的稳定路径（与 sb 共用，零手工）。
+store_root="${STORE_DIR:-/etc/cert-store}"
+store_domain=${domain#\*.}
+if [ -e "$store_root/$store_domain/current/fullchain.pem" ] &&
+   [ -e "$store_root/$store_domain/current/private.key" ]; then
+  sed -i -e "s|/etc/acme-nginx/fullchain.pem|$store_root/$store_domain/current/fullchain.pem|g" \
+    -e "s|/etc/acme-nginx/privkey.pem|$store_root/$store_domain/current/private.key|g" "$tmp"
+fi
+
 if [ "$do_install" -eq 0 ]; then
   if [ -n "$out" ]; then
     mkdir -p -- "$(dirname -- "$out")"

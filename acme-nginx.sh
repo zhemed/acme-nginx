@@ -50,7 +50,7 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-acme_nginx_version="v0.4.2"
+acme_nginx_version="v0.5.0"
 
 valid_ipv4(){
   local ip=$1 IFS=. octets octet
@@ -154,6 +154,16 @@ config_is_present(){
   config_mode_is_private
 }
 
+default_cert_source(){
+  local root
+  root=${STORE_DIR:-/etc/cert-store}
+  if compgen -G "$root"/*/current/fullchain.pem >/dev/null 2>&1; then
+    printf '%s\n' store
+  else
+    printf '%s\n' own
+  fi
+}
+
 write_config_template(){
   if [[ -e $CONFIG_FILE || -L $CONFIG_FILE ]]; then
     [[ -f $CONFIG_FILE && ! -L $CONFIG_FILE ]] || return 1
@@ -182,7 +192,7 @@ write_config_template(){
     printf '%s\n' '# 是否同时申请泛域名证书：1（默认）同时签 *.DOMAIN；0 只申请单域名'
     printf '%s\n' 'WILDCARD=1'
     printf '%s\n' '# 证书来源：own=本工具签发；store=领养 /etc/cert-store 共享证书库（与 sb 共用）'
-    printf '%s\n' 'CERT_SOURCE=own'
+    printf 'CERT_SOURCE=%s\n' "$(default_cert_source)"
     printf '%s\n' '# 共享证书库目录（CERT_SOURCE=store 时使用）'
     printf '%s\n' 'STORE_DIR=/etc/cert-store'
   } > "$tmp" || ! chmod 600 "$tmp" || ! mv -fT -- "$tmp" "$CONFIG_FILE"; then
@@ -1468,6 +1478,22 @@ adopt_store_certificate(){
   return 0
 }
 
+# 检测到本机 sb 服务时，自动创建证书部署后的重启钩子（不覆盖已有自定义钩子）。
+ensure_sb_restart_post_hook(){
+  local hook="$STATE_DIR/post_reload.sh" tmp
+  [[ -e $hook || -L $hook ]] && return 0
+  command -v systemctl >/dev/null 2>&1 || return 0
+  [[ -d /run/systemd/system ]] || return 0
+  systemctl cat sb >/dev/null 2>&1 || return 0
+  tmp=$(mktemp "$STATE_DIR/.post_reload.XXXXXX") || return 1
+  if ! printf '%s\n' '#!/bin/bash' '# acme-nginx-managed sb restart hook (auto-created)' \
+       'systemctl restart sb' > "$tmp" ||
+     ! chmod 700 "$tmp" || ! mv -fT -- "$tmp" "$hook"; then
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
 issue_certificate(){
   local -a issue_args
   local provider plugin current_identity
@@ -2104,6 +2130,7 @@ cmd_install(){
   fi
   install_official_acme || return 1
   green "acme.sh v${ACME_VERSION} 安装完成"
+  ensure_sb_restart_post_hook || true
 }
 
 cmd_issue(){
@@ -2119,6 +2146,7 @@ cmd_issue(){
   if store_mode; then
     if store_certificate_is_adoptable; then
       adopt_store_certificate || return 1
+      ensure_sb_restart_post_hook || true
       return 0
     fi
     store_owner_value=$(store_owner 2>/dev/null || true)
@@ -2145,6 +2173,7 @@ cmd_issue(){
   if ! with_acme_lock issue_certificate; then
     return 1
   fi
+  ensure_sb_restart_post_hook || true
   if ! with_acme_lock setup_acme_renew_cron; then
     yellow "证书已签发，但自动续期任务设置失败，请检查 root crontab 与 cron 服务"
   else

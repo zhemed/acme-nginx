@@ -1179,6 +1179,36 @@ ensure_sb_restart_post_hook(){
   fi
 }
 
+store_owner_present(){
+  case ${1-} in
+    acme-nginx) return 0 ;;
+    sb) [[ -s /etc/sb/sb.json ]] && systemctl is-active --quiet sb 2>/dev/null ;;
+    *) return 1 ;;
+  esac
+}
+
+store_release_ownership(){
+  local owner=$1 root dir meta_tmp now
+  [[ ${owner-} == acme-nginx ]] || return 1
+  root=$(store_root) || return 1
+  [[ -d $root && ! -L $root ]] || return 0
+  for dir in "$root"/*/; do
+    [[ -d $dir && ! -L $dir ]] || continue
+    dir=${dir%/}
+    [[ -f $dir/meta.env && ! -L $dir/meta.env ]] || continue
+    [[ $(sed -n 's/^owner=//p' "$dir/meta.env" | head -n 1) == acme-nginx ]] || continue
+    now=$(date +%s) || continue
+    meta_tmp=$(mktemp "$dir/.meta.XXXXXX") || continue
+    if sed -e "s/^owner=.*/owner=none/" -e "s/^updated_by=.*/updated_by=acme-nginx/" \
+         -e "s/^updated_at=.*/updated_at=$now/" "$dir/meta.env" > "$meta_tmp" &&
+       chmod 600 "$meta_tmp" && mv -fT -- "$meta_tmp" "$dir/meta.env"; then
+      :
+    else
+      rm -f "$meta_tmp"
+    fi
+  done
+}
+
 issue_certificate(){
   local -a issue_args
   local provider plugin current_identity

@@ -98,8 +98,18 @@ cmd_renew(){
   prepare_state_dir || { red "初始化状态目录失败：$STATE_DIR"; return 1; }
   if store_mode; then
     store_owner_value=$(store_owner 2>/dev/null || true)
-    if [[ $store_owner_value != acme-nginx ]]; then
-      green "共享证书库由 ${store_owner_value:-未知} 负责续期；本机跳过签发"
+    if [[ $store_owner_value == acme-nginx ]]; then
+      :
+    elif [[ $store_owner_value == sb ]] && store_owner_present sb; then
+      green "共享证书库由 sb 负责续期；本机跳过签发"
+      return 0
+    else
+      yellow "共享证书库无有效续期负责人（owner: ${store_owner_value:-none}），尝试重新签发接管"
+      if ! with_acme_lock issue_certificate; then
+        red "接管续期失败，请检查凭据后重试"
+        return 1
+      fi
+      with_acme_lock setup_acme_renew_cron || true
       return 0
     fi
   fi
@@ -266,6 +276,9 @@ cmd_status(){
     if store_certificate_is_adoptable; then
       show_certificate_metadata "共享证书库（/etc/cert-store）" "$STORE_CERT" "$STORE_KEY" "$ACME_PRIMARY_DOMAIN"
       printf '共享证书库: %s（owner: %s）\n' "$(store_domain_dir)" "$(store_owner 2>/dev/null || echo 未知)"
+      if ! store_owner_present "$(store_owner 2>/dev/null || true)"; then
+        yellow "续期负责人当前不可用，请重新签发接管续期"
+      fi
       printf 'Nginx 引用路径: %s / %s\n' "$STORE_CERT" "$STORE_KEY"
     else
       red "共享证书库中暂无可领养的证书：$(store_domain_dir 2>/dev/null || echo 未知)"
@@ -315,6 +328,7 @@ cmd_status(){
 }
 
 cmd_uninstall(){
+  store_release_ownership acme-nginx >/dev/null 2>&1 || true
   if ! with_acme_lock remove_acme_renew_cron; then
     red "移除续期定时任务失败"
     return 1

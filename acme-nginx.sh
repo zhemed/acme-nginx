@@ -50,7 +50,7 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-acme_nginx_version="v0.5.0"
+acme_nginx_version="v0.6.0"
 
 valid_ipv4(){
   local ip=$1 IFS=. octets octet
@@ -1494,6 +1494,36 @@ ensure_sb_restart_post_hook(){
   fi
 }
 
+store_owner_present(){
+  case ${1-} in
+    acme-nginx) return 0 ;;
+    sb) [[ -s /etc/sb/sb.json ]] && systemctl is-active --quiet sb 2>/dev/null ;;
+    *) return 1 ;;
+  esac
+}
+
+store_release_ownership(){
+  local owner=$1 root dir meta_tmp now
+  [[ ${owner-} == acme-nginx ]] || return 1
+  root=$(store_root) || return 1
+  [[ -d $root && ! -L $root ]] || return 0
+  for dir in "$root"/*/; do
+    [[ -d $dir && ! -L $dir ]] || continue
+    dir=${dir%/}
+    [[ -f $dir/meta.env && ! -L $dir/meta.env ]] || continue
+    [[ $(sed -n 's/^owner=//p' "$dir/meta.env" | head -n 1) == acme-nginx ]] || continue
+    now=$(date +%s) || continue
+    meta_tmp=$(mktemp "$dir/.meta.XXXXXX") || continue
+    if sed -e "s/^owner=.*/owner=none/" -e "s/^updated_by=.*/updated_by=acme-nginx/" \
+         -e "s/^updated_at=.*/updated_at=$now/" "$dir/meta.env" > "$meta_tmp" &&
+       chmod 600 "$meta_tmp" && mv -fT -- "$meta_tmp" "$dir/meta.env"; then
+      :
+    else
+      rm -f "$meta_tmp"
+    fi
+  done
+}
+
 issue_certificate(){
   local -a issue_args
   local provider plugin current_identity
@@ -2196,8 +2226,18 @@ cmd_renew(){
   prepare_state_dir || { red "初始化状态目录失败：$STATE_DIR"; return 1; }
   if store_mode; then
     store_owner_value=$(store_owner 2>/dev/null || true)
-    if [[ $store_owner_value != acme-nginx ]]; then
-      green "共享证书库由 ${store_owner_value:-未知} 负责续期；本机跳过签发"
+    if [[ $store_owner_value == acme-nginx ]]; then
+      :
+    elif [[ $store_owner_value == sb ]] && store_owner_present sb; then
+      green "共享证书库由 sb 负责续期；本机跳过签发"
+      return 0
+    else
+      yellow "共享证书库无有效续期负责人（owner: ${store_owner_value:-none}），尝试重新签发接管"
+      if ! with_acme_lock issue_certificate; then
+        red "接管续期失败，请检查凭据后重试"
+        return 1
+      fi
+      with_acme_lock setup_acme_renew_cron || true
       return 0
     fi
   fi
@@ -2364,6 +2404,9 @@ cmd_status(){
     if store_certificate_is_adoptable; then
       show_certificate_metadata "共享证书库（/etc/cert-store）" "$STORE_CERT" "$STORE_KEY" "$ACME_PRIMARY_DOMAIN"
       printf '共享证书库: %s（owner: %s）\n' "$(store_domain_dir)" "$(store_owner 2>/dev/null || echo 未知)"
+      if ! store_owner_present "$(store_owner 2>/dev/null || true)"; then
+        yellow "续期负责人当前不可用，请重新签发接管续期"
+      fi
       printf 'Nginx 引用路径: %s / %s\n' "$STORE_CERT" "$STORE_KEY"
     else
       red "共享证书库中暂无可领养的证书：$(store_domain_dir 2>/dev/null || echo 未知)"
@@ -2413,6 +2456,7 @@ cmd_status(){
 }
 
 cmd_uninstall(){
+  store_release_ownership acme-nginx >/dev/null 2>&1 || true
   if ! with_acme_lock remove_acme_renew_cron; then
     red "移除续期定时任务失败"
     return 1

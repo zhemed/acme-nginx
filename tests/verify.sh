@@ -34,12 +34,12 @@ grep -Fq -- 'https://codeload.github.com/acmesh-official/acme.sh/tar.gz/refs/tag
 if grep -Fq -- '--install-online' "$ROOT_DIR/acme-nginx.sh"; then
   fail "unverified acme.sh online installer remains"
 fi
-[[ $(grep -Fxc 'acme_nginx_version="v0.5.0"' "$ROOT_DIR/acme-nginx.sh" || true) -eq 1 ]] ||
-  fail "script version is not 0.5.0"
-[[ $(tr -d '\r\n' < "$ROOT_DIR/VERSION") == '0.5.0' ]] ||
-  fail "VERSION file is not 0.5.0"
-grep -Fq -- "当前版本：0.5.0" "$ROOT_DIR/README.md" ||
-  fail "README project version is not 0.5.0"
+[[ $(grep -Fxc 'acme_nginx_version="v0.6.0"' "$ROOT_DIR/acme-nginx.sh" || true) -eq 1 ]] ||
+  fail "script version is not 0.6.0"
+[[ $(tr -d '\r\n' < "$ROOT_DIR/VERSION") == '0.6.0' ]] ||
+  fail "VERSION file is not 0.6.0"
+grep -Fq -- "当前版本：0.6.0" "$ROOT_DIR/README.md" ||
+  fail "README project version is not 0.6.0"
 
 for store_pattern in \
   'CERT_SOURCE=store' \
@@ -64,6 +64,10 @@ for auto_pattern in \
 done
 grep -Fq -- '/etc/cert-store' "$ROOT_DIR/scripts/new-nginx-conf.sh" ||
   fail "new-nginx-conf.sh does not auto-use shared certificate paths"
+for owner_pattern in 'store_release_ownership(){' 'store_owner_present(){'; do
+  grep -Fq -- "$owner_pattern" "$ROOT_DIR/acme-nginx.sh" ||
+    fail "dynamic ownership support is missing: $owner_pattern"
+done
 
 # shellcheck disable=SC2016
 for pattern in \

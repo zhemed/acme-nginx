@@ -427,6 +427,14 @@ remove_acme_renew_cron(){
 }
 
 setup_acme_renew_cron(){
+  if store_mode; then
+    local store_owner_value
+    store_owner_value=$(store_owner 2>/dev/null || true)
+    if [[ $store_owner_value != acme-nginx ]]; then
+      remove_acme_renew_cron 2>/dev/null || true
+      return 0
+    fi
+  fi
   local current filtered entry identity
   if ! cron_daemon_is_active; then
     red "cron/crond 服务未运行，拒绝写入无法执行的 ACME 续期任务"

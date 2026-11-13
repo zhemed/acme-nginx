@@ -93,6 +93,13 @@ cmd_renew(){
     return 1
   fi
   prepare_state_dir || { red "初始化状态目录失败：$STATE_DIR"; return 1; }
+  if store_mode; then
+    store_owner_value=$(store_owner 2>/dev/null || true)
+    if [[ $store_owner_value != acme-nginx ]]; then
+      green "共享证书库由 ${store_owner_value:-未知} 负责续期；本机跳过签发"
+      return 0
+    fi
+  fi
   if ! with_acme_lock setup_acme_renew_cron; then
     red "自动续期组件修复失败，无法执行检查"
     return 1

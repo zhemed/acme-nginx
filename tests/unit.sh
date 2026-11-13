@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC2016,SC2030,SC2031,SC2329  # literal generated text; subshell-owned vars/stubs
+# shellcheck disable=SC2016,SC2030,SC2031,SC2034,SC2329  # literal generated text; subshell-owned vars/stubs
 set -Eeuo pipefail
 
 export LC_ALL=C
@@ -69,10 +69,10 @@ export ACME_GENERATIONS="$ACME_LIVE/generations"
 export ACME_CURRENT="$ACME_LIVE/current"
 export ACME_LOCK="$STATE_DIR/acme.lock"
 export ACME_CRON_MARKER="# acme-nginx-managed"
-export ACME_RELOAD_IDENTITY="# acme-nginx-reload-v4"
+export ACME_RELOAD_IDENTITY="# acme-nginx-reload-v5"
 export CERT_SOURCE=own
 export STORE_DIR=/etc/cert-store
-export ACME_RENEW_IDENTITY="# acme-nginx-renew-v5"
+export ACME_RENEW_IDENTITY="# acme-nginx-renew-v6"
 export ACME_VERSION="3.1.4"
 export ACME_ARCHIVE_SHA256="e5f8e187bbf5251e0cd8891f2622daab9850366bd17bea9f92c2fe2ee091fd32"
 export ACME_RENEW_RUNNER="$STATE_DIR/renew.sh"
@@ -1055,7 +1055,7 @@ reload_hook_publishes_store_before_reload(){
     write_acme_reload_hook || return 1
     reload_line=$(grep -n '^if reload_nginx; then' "$hook" | head -n 1 | cut -d: -f1)
     flock_line=$(grep -n 'flock -w 30 7 || exit 1' "$hook" | head -n 1 | cut -d: -f1)
-    owner_line=$(grep -n 'owner=$(sed -n' "$hook" | head -n 1 | cut -d: -f1)
+    owner_line=$(grep -n 'owner=$(sed -n' "$hook" | tail -n 1 | cut -d: -f1)
     [[ -n $reload_line && -n $flock_line && -n $owner_line ]] || return 1
     ((reload_line > 1)) || return 1
     # 必须是 reload 语句的“上一行”发布（函数体内也有一处相同文本，不能用第一个匹配）。
@@ -1196,8 +1196,8 @@ write_claim_meta(){
   local dir=$1 owner=$2 now fp
   now=$(date +%s)
   fp=$(printf 'b%.0s' {1..64})
-  printf 'version=1\ndomain=example.com\nalt=\nowner=%s\nissuer=letsencrypt\nissued_at=%s\nnot_after=%s\nfingerprint=%s\nupdated_at=%s\nupdated_by=%s\n' \
-    "$owner" "$now" "$now" "$fp" "$now" "$owner" > "$dir/meta.env"
+  printf 'version=1\ndomain=example.com\nalt=\nowner=%s\nissuer=letsencrypt\nissued_at=%s\nnot_after=%s\nfingerprint=%s\nupdated_at=%s\nupdated_by=acme-nginx\n' \
+    "$owner" "$now" "$now" "$fp" "$now" > "$dir/meta.env"
   chmod 600 "$dir/meta.env"
 }
 
@@ -1232,7 +1232,24 @@ store_claim_issuance_checks_live_owner_and_rolls_back(){
     # meta 缺失：claim 为 no-op 成功
     rm -f "$dir/meta.env"
     store_claim_issuance acme-nginx || return 1
-    [[ -z $STORE_CLAIM_PREVIOUS ]]
+    [[ -z $STORE_CLAIM_PREVIOUS ]] || return 1
+    # meta 存在但损坏（未知字段）：claim 拒绝（返回 3），meta 不变
+    local claim_rc=0 corrupt_before=''
+    write_claim_meta "$dir" none
+    printf 'unknown=1\n' >> "$dir/meta.env"
+    chmod 600 "$dir/meta.env"
+    corrupt_before=$(cat "$dir/meta.env")
+    store_claim_issuance acme-nginx || claim_rc=$?
+    [[ $claim_rc -eq 3 ]] || return 1
+    [[ $(cat "$dir/meta.env") == "$corrupt_before" ]] || return 1
+    # meta 换成符号链接也算损坏
+    rm -f "$dir/meta.env"
+    printf '%s\n' 'version=1' > "$TEMP_DIR/claim-meta-target"
+    ln -s "$TEMP_DIR/claim-meta-target" "$dir/meta.env"
+    claim_rc=0
+    store_claim_issuance acme-nginx || claim_rc=$?
+    [[ $claim_rc -eq 3 ]] || return 1
+    rm -f "$dir/meta.env"
   )
 }
 expect_success "store claim rejects a live other owner and rolls back on failure" \
@@ -1265,9 +1282,168 @@ issue_certificate_claims_before_issuing(){
     write_claim_meta "$dir" sb
     issue_certificate_core(){ return 1; }
     ! issue_certificate || return 1
-    [[ $(sed -n 's/^owner=//p' "$dir/meta.env" | head -n 1) == sb ]]
+    [[ $(sed -n 's/^owner=//p' "$dir/meta.env" | head -n 1) == sb ]] || return 1
+    # meta 损坏：claim 拒绝（3），签发 core 不被调用
+    write_claim_meta "$dir" none
+    printf 'unknown=1\n' >> "$dir/meta.env"
+    chmod 600 "$dir/meta.env"
+    rm -f "$marker"
+    issue_certificate_core(){ : > "$marker"; return 0; }
+    ! issue_certificate || return 1
+    [[ ! -e $marker ]] || return 1
+    # 显式 skip_claim=1：存活的其他工具 owner 也允许签发（接管意图）
+    write_claim_meta "$dir" sb
+    store_owner_present(){ [[ ${1-} == sb ]]; }
+    issue_certificate 0 1 || return 1
+    [[ -e $marker ]] || return 1
+    [[ $(sed -n 's/^owner=//p' "$dir/meta.env" | head -n 1) == sb ]] || return 1
+    # 崩溃回滚：core 收到 TERM 时 EXIT trap 恢复原 owner
+    store_owner_present(){ return 1; }
+    write_claim_meta "$dir" sb
+    issue_certificate_core(){ kill -TERM "$BASHPID"; sleep 5; return 0; }
+    local rc=0
+    ( issue_certificate ) || rc=$?
+    [[ $rc -eq 143 ]] || return 1
+    [[ $(sed -n 's/^owner=//p' "$dir/meta.env" | head -n 1) == sb ]] || return 1
+    # 成功路径不回滚：owner 保持 claim 占位
+    issue_certificate_core(){ return 0; }
+    issue_certificate || return 1
+    [[ $(sed -n 's/^owner=//p' "$dir/meta.env" | head -n 1) == acme-nginx ]]
   )
 }
 expect_success "issue certificate claims before issuing and releases on failure" \
   issue_certificate_claims_before_issuing
 pass "live other owner blocks issuance and failed issuance restores the previous owner"
+
+# --- v0.7.1：runner 锁失败且无证书指纹时写 failed（不是非法 skipped）---
+runner_fails_closed_records_failed_without_fingerprint(){
+  (
+    local store="$TEMP_DIR/runner-lock-fail-store2" marker="$TEMP_DIR/runner-lock-fail-called2"
+    local fakebin="$TEMP_DIR/fake-logger-bin2" logger_log="$TEMP_DIR/fake-logger2.log"
+    local output
+    printf '%s\n' 'example.com' > "$ACME_IDENTITY"
+    rm -rf "$store" "$marker" "$fakebin" "$logger_log"
+    rm -f "$ACME_CERT" "$ACME_RENEW_STATE"
+    mkdir -p "$store" "$fakebin" && chmod 700 "$store" "$fakebin" || return 1
+    mkdir "$store/.lock" || return 1
+    printf '%s\n' '#!/bin/bash' "printf '%s\n' \"\$*\" >> '$logger_log'" 'exit 0' > "$fakebin/logger"
+    chmod 700 "$fakebin/logger"
+    printf '%s\n' '#!/bin/bash' ": > '$marker'" 'exit 0' > "$ACME_BIN"
+    chmod 700 "$ACME_BIN"
+    STORE_DIR="$store" write_acme_renew_runner || return 1
+    output=$(PATH="$fakebin:$PATH" "$ACME_RENEW_RUNNER" 2>&1) || return 1
+    [[ ! -e $marker ]] || return 1
+    [[ $output == *'共享证书库锁获取失败'* ]] || return 1
+    load_acme_renew_state || return 1
+    [[ $ACME_RENEW_LAST_RESULT == failed &&
+       $ACME_RENEW_LAST_EXIT_CODE -eq 1 &&
+       -z $ACME_RENEW_FINGERPRINT ]] || return 1
+    write_acme_renew_runner
+  )
+}
+expect_success "runner writes a loadable failed state when no certificate fingerprint exists" \
+  runner_fails_closed_records_failed_without_fingerprint
+pass "empty fingerprint is recorded as failed instead of an invalid skipped state"
+
+# --- v0.7.1：reload hook store_publish 的损坏 meta / 旧证书闸 ---
+hook_store_publish_skips_corrupt_meta_and_older_cert(){
+  (
+    local hook="$TEMP_DIR/hook-publish-reload.sh"
+    local store="$TEMP_DIR/hook-publish-store" fn="$TEMP_DIR/hook-publish-fn.sh"
+    local messages="$TEMP_DIR/hook-publish-messages" dir="$store/example.com"
+    local certdir="$TEMP_DIR/hook-publish-certs" before=''
+    rm -rf "$store" "$fn" "$messages" "$certdir"
+    mkdir -p "$store" "$certdir" && chmod 700 "$store" "$certdir" || return 1
+    STORE_DIR="$store" ACME_RELOAD="$hook" write_acme_reload_hook || return 1
+    awk '/^store_meta_is_valid\(\)\{/{inside=1} inside{print} inside && /^}$/{exit}' "$hook" >> "$fn" || return 1
+    awk '/^store_publish\(\)\{/{inside=1} inside{print} inside && /^}$/{exit}' "$hook" >> "$fn" || return 1
+    [[ -s $fn ]] || return 1
+    # shellcheck source=/dev/null
+    source "$fn"
+    store_root="$store"
+    warn_post_reload(){ printf '%s\n' "$1" >> "$messages"; }
+    cat > "$certdir/cert.cnf" <<'CERTCONFIG'
+[req]
+distinguished_name = subject
+x509_extensions = extensions
+prompt = no
+
+[subject]
+CN = example.com
+
+[extensions]
+subjectAltName = DNS:example.com,DNS:*.example.com
+CERTCONFIG
+    openssl ecparam -genkey -name prime256v1 -out "$certdir/newer.key" >/dev/null 2>&1 || return 1
+    openssl req -new -x509 -days 30 -key "$certdir/newer.key" \
+      -out "$certdir/newer.pem" -config "$certdir/cert.cnf" >/dev/null 2>&1 || return 1
+    openssl ecparam -genkey -name prime256v1 -out "$certdir/older.key" >/dev/null 2>&1 || return 1
+    openssl req -new -x509 -days 1 -key "$certdir/older.key" \
+      -out "$certdir/older.pem" -config "$certdir/cert.cnf" >/dev/null 2>&1 || return 1
+    cert="$certdir/newer.pem"
+    key="$certdir/newer.key"
+    identity=example.com
+    # 损坏 meta：存在但字段不全 → 跳过发布并 warn
+    mkdir -p "$dir" && chmod 700 "$dir" || return 1
+    printf '%s\n' 'owner=sb' > "$dir/meta.env"
+    chmod 600 "$dir/meta.env"
+    store_publish example.com || return 1
+    [[ ! -e $dir/current ]] || return 1
+    grep -Fq 'meta is corrupt; skip publish' "$messages" || return 1
+    # 正常发布 newer 后，再发布 older 应跳过且 current 不变
+    rm -f "$dir/meta.env" "$messages"
+    store_publish example.com || return 1
+    before=$(readlink "$dir/current") || return 1
+    cert="$certdir/older.pem"
+    key="$certdir/older.key"
+    store_publish example.com || return 1
+    [[ $(readlink "$dir/current") == "$before" ]] || return 1
+    grep -Fq 'skip publishing older one' "$messages"
+  )
+}
+expect_success "reload hook store_publish skips corrupt meta and older certificates" \
+  hook_store_publish_skips_corrupt_meta_and_older_cert
+pass "hook-side publish gate warns and keeps the current generation"
+
+# --- v0.7.1：load_config 校验 STORE_DIR ---
+store_dir_config_validation_rejects_invalid_paths(){
+  (
+    # 其余用例使用测试桩；这里加载真实 bootstrap + 10-acme 以验证真实 load_config。
+    # shellcheck source=/dev/null
+    source "$ROOT_DIR/src/00-bootstrap.sh"
+    # shellcheck source=/dev/null
+    source "$ROOT_DIR/src/10-acme.sh"
+    CONFIG_FILE="$TEMP_DIR/store-dir-config.conf"
+    write_store_dir_config(){
+      local value=${1-}
+      {
+        printf '%s\n' \
+          'DNS_PROVIDER=cloudflare' \
+          'CF_ACCOUNT_ID=0123456789abcdef0123456789abcdef' \
+          'CF_TOKEN=fixture_token_123' \
+          'STAGING=0' \
+          'DOMAIN=example.com' \
+          'WILDCARD=0' \
+          'CERT_SOURCE=store'
+        [[ -z $value ]] || printf 'STORE_DIR=%s\n' "$value"
+      } > "$CONFIG_FILE"
+      chmod 600 "$CONFIG_FILE"
+    }
+    write_store_dir_config '/etc/cert-store'
+    load_config >/dev/null 2>&1 || return 1
+    [[ $STORE_DIR == /etc/cert-store ]] || return 1
+    write_store_dir_config ''
+    load_config >/dev/null 2>&1 || return 1
+    [[ $STORE_DIR == /etc/cert-store ]] || return 1
+    local bad
+    for bad in 'relative/path' '/etc/cert store' '/etc/../escape' '/etc/cert-store/' \
+               '/etc/cert-store/..' '/etc/cert-store"x'; do
+      write_store_dir_config "$bad"
+      ! load_config >/dev/null 2>&1 || return 1
+    done
+    :
+  )
+}
+expect_success "load_config rejects invalid STORE_DIR values" \
+  store_dir_config_validation_rejects_invalid_paths
+pass "STORE_DIR must be a clean absolute path without .. or trailing slash"

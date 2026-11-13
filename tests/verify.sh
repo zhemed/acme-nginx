@@ -34,12 +34,12 @@ grep -Fq -- 'https://codeload.github.com/acmesh-official/acme.sh/tar.gz/refs/tag
 if grep -Fq -- '--install-online' "$ROOT_DIR/acme-nginx.sh"; then
   fail "unverified acme.sh online installer remains"
 fi
-[[ $(grep -Fxc 'acme_nginx_version="v0.7.0"' "$ROOT_DIR/acme-nginx.sh" || true) -eq 1 ]] ||
-  fail "script version is not 0.7.0"
-[[ $(tr -d '\r\n' < "$ROOT_DIR/VERSION") == '0.7.0' ]] ||
-  fail "VERSION file is not 0.7.0"
-grep -Fq -- "当前版本：0.7.0" "$ROOT_DIR/README.md" ||
-  fail "README project version is not 0.7.0"
+[[ $(grep -Fxc 'acme_nginx_version="v0.7.1"' "$ROOT_DIR/acme-nginx.sh" || true) -eq 1 ]] ||
+  fail "script version is not 0.7.1"
+[[ $(tr -d '\r\n' < "$ROOT_DIR/VERSION") == '0.7.1' ]] ||
+  fail "VERSION file is not 0.7.1"
+grep -Fq -- "当前版本：0.7.1" "$ROOT_DIR/README.md" ||
+  fail "README project version is not 0.7.1"
 
 for store_pattern in \
   'CERT_SOURCE=store' \
@@ -91,8 +91,8 @@ fi
 # v0.6.5：hook 先发布 store 再 reload；发布/owner 判定在 store 锁内；runner 短暂持锁读 owner。
 # shellcheck disable=SC2016
 for ordering_pattern in \
-  '# acme-nginx-reload-v4' \
-  '# acme-nginx-renew-v5' \
+  '# acme-nginx-reload-v5' \
+  '# acme-nginx-renew-v6' \
   '共享证书库锁获取失败，跳过本次续期（无法确认续期负责人）' \
   'store_publish "$identity" || true' \
   '  if exec 8> "$store_root/.lock"; then' \
@@ -113,10 +113,20 @@ for claim_pattern in \
   '拒绝重复签发（如需接管请运行 acme-nginx force-renew）' \
   'log_renewal_warning(){' \
   'write_skipped_state(){' \
-  'command -v logger'; do
+  'command -v logger' \
+  'arm_issue_claim_rollback(){' \
+  'disarm_issue_claim_rollback(){' \
+  'acm_claim_rollback_on_exit(){' \
+  '共享证书库 meta 损坏，拒绝签发，请先修复' \
+  'store_meta_is_valid(){' \
+  'shared certificate store meta is corrupt; skip publish' \
+  'shared certificate store already has a newer certificate; skip publishing older one' \
+  '没有可用证书指纹时不能写 skipped'; do
   grep -Fq -- "$claim_pattern" "$ROOT_DIR/acme-nginx.sh" ||
-    fail "v0.7.0 pre-issue claim/fail-closed support is missing: $claim_pattern"
+    fail "v0.7.1 pre-issue claim/fail-closed support is missing: $claim_pattern"
 done
+grep -Fq -- 'own 模式' "$ROOT_DIR/README.md" ||
+  fail "README does not document own-mode claim rejection"
 # 负向门禁：reload hook 必须先发布共享库再 reload，否则 store 模式会加载上一代证书。
 # 断言的是 reload 语句的“上一行”必须是发布语句（finalize_deployment 函数体内也有一处
 # 相同文本，按第一个匹配取行号会得到假门禁）。

@@ -583,7 +583,7 @@ write_acme_reload_hook(){
 #!/bin/bash
 # Signal handlers and EXIT cleanup functions are invoked indirectly by Bash.
 # shellcheck disable=SC2317,SC2329
-# acme-nginx-reload-v4
+# acme-nginx-reload-v5
 export LANG=en_US.UTF-8
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 base="/etc/acme-nginx"
@@ -730,10 +730,43 @@ run_post_reload_hook(){
   return 0
 }
 
+# 发布前严格校验共享库 meta.env：常规文件、600、恰好 10 个已知字段、关键字段格式正确。
+store_meta_is_valid(){
+  local meta=$1 owner alt issued_at not_after updated_at fingerprint updated_by
+  [[ -f $meta && ! -L $meta ]] || return 1
+  case $(uname -s 2>/dev/null) in
+    MINGW*|MSYS*) ;;
+    *) [[ $(stat -c '%a' "$meta" 2>/dev/null || true) == 600 ]] || return 1 ;;
+  esac
+  [[ $(sed -n 's/^\([a-z_]*\)=.*/\1/p' "$meta" 2>/dev/null | sort | tr '\n' ' ') == \
+     'alt domain fingerprint issued_at issuer not_after owner updated_at updated_by version ' ]] || return 1
+  grep -Fqx 'version=1' "$meta" 2>/dev/null || return 1
+  grep -Fqx "domain=$identity" "$meta" 2>/dev/null || return 1
+  owner=$(sed -n 's/^owner=//p' "$meta" 2>/dev/null | head -n 1)
+  case $owner in
+    sb|acme-nginx|none) ;;
+    *) return 1 ;;
+  esac
+  alt=$(sed -n 's/^alt=//p' "$meta" 2>/dev/null | head -n 1)
+  [[ -z $alt || $alt == "*.$identity" ]] || return 1
+  issued_at=$(sed -n 's/^issued_at=//p' "$meta" 2>/dev/null | head -n 1)
+  not_after=$(sed -n 's/^not_after=//p' "$meta" 2>/dev/null | head -n 1)
+  updated_at=$(sed -n 's/^updated_at=//p' "$meta" 2>/dev/null | head -n 1)
+  fingerprint=$(sed -n 's/^fingerprint=//p' "$meta" 2>/dev/null | head -n 1)
+  updated_by=$(sed -n 's/^updated_by=//p' "$meta" 2>/dev/null | head -n 1)
+  [[ $issued_at =~ ^[0-9]{1,12}$ && $not_after =~ ^[0-9]{1,12}$ &&
+     $updated_at =~ ^[0-9]{1,12}$ ]] || return 1
+  [[ $fingerprint =~ ^[0-9a-f]{64}$ ]] || return 1
+  case $updated_by in
+    sb|acme-nginx) ;;
+    *) return 1 ;;
+  esac
+}
+
 # 证书成功切换后发布到共享证书库（owner 不是 acme-nginx 时跳过）。
 store_publish(){
   local identity=$1 store_dir generations gen current meta_tmp fingerprint not_after owner
-  local now alt old_current generation current_target enddate not_after_epoch
+  local now alt old_current generation current_target enddate not_after_epoch existing_not_after
   [[ -d $store_root && ! -L $store_root ]] || return 0
   [[ $identity =~ ^[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9]$ ]] || return 0
   store_dir="$store_root/$identity"
@@ -744,7 +777,12 @@ store_publish(){
     chmod 600 "$store_root/.lock" || exit 1
     flock -w 30 7 || exit 1
     # owner 判定必须在锁内：与接管方改写 meta 的窗口期错开，避免把别人的证书覆盖掉。
-    if [[ -f $store_dir/meta.env && ! -L $store_dir/meta.env ]]; then
+    if [[ -e $store_dir/meta.env || -L $store_dir/meta.env ]]; then
+      # meta 存在但损坏（常规文件/符号链接/目录都算）：跳过发布并告警，不阻断部署。
+      if ! store_meta_is_valid "$store_dir/meta.env"; then
+        warn_post_reload "shared certificate store meta is corrupt; skip publish: $identity"
+        exit 0
+      fi
       owner=$(sed -n 's/^owner=//p' "$store_dir/meta.env" 2>/dev/null | head -n 1)
       case $owner in
         acme-nginx|none|'') ;;
@@ -781,6 +819,15 @@ store_publish(){
     if openssl x509 -in "$gen/fullchain.pem" -noout -text 2>/dev/null |
          grep -qE "DNS:\*\.$identity([,[:space:]]|$)"; then
       alt="*.$identity"
+    fi
+    # 防旧覆盖新：库里已有完整有效 meta 且到期更晚时跳过发布（不阻断部署）。
+    if [[ -f $store_dir/meta.env && ! -L $store_dir/meta.env ]]; then
+      existing_not_after=$(sed -n 's/^not_after=//p' "$store_dir/meta.env" 2>/dev/null | head -n 1)
+      if [[ $existing_not_after =~ ^[0-9]{1,12}$ ]] && ((not_after < existing_not_after)); then
+        warn_post_reload "shared certificate store already has a newer certificate; skip publishing older one: $identity"
+        rm -rf -- "$gen"
+        exit 0
+      fi
     fi
     old_current=$(readlink "$store_dir/current" 2>/dev/null || true)
     current=$(mktemp "$store_dir/.current.XXXXXX") || exit 1
@@ -1063,6 +1110,9 @@ acme_reload_hook_is_current(){
     grep -Fqx 'if reload_nginx; then' "$ACME_RELOAD" 2>/dev/null &&
     store_root_is_current &&
     grep -Fqx 'store_publish(){' "$ACME_RELOAD" 2>/dev/null &&
+    grep -Fqx 'store_meta_is_valid(){' "$ACME_RELOAD" 2>/dev/null &&
+    grep -Fq -- 'shared certificate store meta is corrupt; skip publish' "$ACME_RELOAD" 2>/dev/null &&
+    grep -Fq -- 'shared certificate store already has a newer certificate; skip publishing older one' "$ACME_RELOAD" 2>/dev/null &&
     grep -Fqx 'finalize_deployment(){' "$ACME_RELOAD" 2>/dev/null &&
     [[ $(grep -Fxc '  finalize_deployment' "$ACME_RELOAD" 2>/dev/null || true) -eq 1 ]] &&
     [[ $(grep -Fxc '  run_post_reload_hook' "$ACME_RELOAD" 2>/dev/null || true) -eq 2 ]] &&
@@ -1416,15 +1466,24 @@ store_claim_issuance(){
   STORE_CLAIM_PREVIOUS=
   [[ -d $root && ! -L $root ]] || return 0
   [[ -d $dir && ! -L $dir ]] || return 0
-  [[ -f $dir/meta.env && ! -L $dir/meta.env ]] || return 0
+  if [[ ! -e $dir/meta.env && ! -L $dir/meta.env ]]; then
+    return 0
+  fi
+  # meta 存在（常规文件/符号链接/目录）但无法按契约解析：拒绝签发而不是当成"其他工具"。
+  if ! store_read_meta "$ACME_PRIMARY_DOMAIN" >/dev/null 2>&1; then
+    return 3
+  fi
   output=$(
     set -u
     umask 077
     exec 7> "$root/.lock" || exit 1
     chmod 600 "$root/.lock" || exit 1
     flock -w 30 7 || exit 1
-    [[ -f $dir/meta.env && ! -L $dir/meta.env ]] || exit 0
-    owner=$(sed -n 's/^owner=//p' "$dir/meta.env" 2>/dev/null | head -n 1)
+    if [[ ! -e $dir/meta.env && ! -L $dir/meta.env ]]; then
+      exit 0
+    fi
+    store_read_meta "$ACME_PRIMARY_DOMAIN" >/dev/null 2>&1 || exit 3
+    owner=$STORE_META_OWNER
     case $owner in
       acme-nginx) printf '%s\n' "$owner"; exit 0 ;;
       ''|none) store_set_owner_locked "$dir" acme-nginx || exit 1 ;;
@@ -1600,28 +1659,76 @@ ensure_shared_cert_store_published(){
 }
 
 issue_certificate(){
-  local force=${1:-0} claim_status=0 claim_previous=''
+  local force=${1:-0} skip_claim=${2:-0} claim_status=0 claim_previous=''
   [[ $force == 0 || $force == 1 ]] || return 1
-  store_claim_issuance acme-nginx || claim_status=$?
-  case $claim_status in
-    0) ;;
-    2)
-      red "共享证书库由其他工具负责续期，拒绝重复签发（如需接管请运行 acme-nginx force-renew）"
-      return 1
-      ;;
-    *)
-      red "共享证书库锁获取失败，无法在签发前确认续期负责人"
-      return 1
-      ;;
-  esac
-  claim_previous=${STORE_CLAIM_PREVIOUS:-}
+  [[ $skip_claim == 0 || $skip_claim == 1 ]] || return 1
+  if [[ $skip_claim -eq 0 ]]; then
+    store_claim_issuance acme-nginx || claim_status=$?
+    case $claim_status in
+      0) ;;
+      2)
+        red "共享证书库由其他工具负责续期，拒绝重复签发（如需接管请运行 acme-nginx force-renew）"
+        return 1
+        ;;
+      3)
+        red "共享证书库 meta 损坏，拒绝签发，请先修复"
+        return 1
+        ;;
+      *)
+        red "共享证书库锁获取失败，无法在签发前确认续期负责人"
+        return 1
+        ;;
+    esac
+    claim_previous=${STORE_CLAIM_PREVIOUS:-}
+    arm_issue_claim_rollback "$claim_previous"
+  fi
   if issue_certificate_core "$force"; then
+    disarm_issue_claim_rollback
     return 0
   fi
-  if ! store_release_claim acme-nginx "$claim_previous"; then
+  disarm_issue_claim_rollback
+  if [[ $skip_claim -eq 0 ]] && ! store_release_claim acme-nginx "$claim_previous"; then
     yellow "签发失败，且共享证书库 owner 回滚失败，请检查 $STORE_DIR"
   fi
   return 1
+}
+
+# ---------- item 4: claim 崩溃回滚 trap（EXIT/INT/TERM）----------
+ACMECLAIM_ROLLBACK_ARMED=0
+ACMECLAIM_ROLLBACK_PREVIOUS=
+ACMECLAIM_SAVED_EXIT=
+ACMECLAIM_SAVED_INT=
+ACMECLAIM_SAVED_TERM=
+
+acm_claim_rollback_on_exit(){
+  if [[ ${ACMECLAIM_ROLLBACK_ARMED:-0} -eq 1 ]]; then
+    store_release_claim acme-nginx "${ACMECLAIM_ROLLBACK_PREVIOUS:-}" >/dev/null 2>&1 || true
+    ACMECLAIM_ROLLBACK_ARMED=0
+  fi
+}
+
+arm_issue_claim_rollback(){
+  ACMECLAIM_ROLLBACK_PREVIOUS=${1-}
+  ACMECLAIM_ROLLBACK_ARMED=1
+  ACMECLAIM_SAVED_EXIT=$(trap -p EXIT)
+  ACMECLAIM_SAVED_INT=$(trap -p INT)
+  ACMECLAIM_SAVED_TERM=$(trap -p TERM)
+  # shellcheck disable=SC2064
+  trap 'acm_claim_rollback_on_exit' EXIT
+  # shellcheck disable=SC2064
+  trap 'exit 130' INT
+  # shellcheck disable=SC2064
+  trap 'exit 143' TERM
+}
+
+disarm_issue_claim_rollback(){
+  ACMECLAIM_ROLLBACK_ARMED=0
+  if [[ -n ${ACMECLAIM_SAVED_EXIT:-} ]]; then eval "$ACMECLAIM_SAVED_EXIT"; else trap - EXIT; fi
+  if [[ -n ${ACMECLAIM_SAVED_INT:-} ]]; then eval "$ACMECLAIM_SAVED_INT"; else trap - INT; fi
+  if [[ -n ${ACMECLAIM_SAVED_TERM:-} ]]; then eval "$ACMECLAIM_SAVED_TERM"; else trap - TERM; fi
+  ACMECLAIM_SAVED_EXIT=
+  ACMECLAIM_SAVED_INT=
+  ACMECLAIM_SAVED_TERM=
 }
 
 issue_certificate_core(){

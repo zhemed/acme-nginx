@@ -82,7 +82,7 @@ acme_renew_state_path(){
 }
 
 acme_renew_runner_identity(){
-  printf '%s\n' "${ACME_RENEW_IDENTITY:-# acme-nginx-renew-v5}"
+  printf '%s\n' "${ACME_RENEW_IDENTITY:-# acme-nginx-renew-v6}"
 }
 
 # Parsed values are consumed by the certificate management module.
@@ -240,6 +240,8 @@ acme_renew_runner_is_current(){
     grep -Fqx -- 'log_renewal_warning(){' "$runner" 2>/dev/null &&
     grep -Fqx -- 'write_skipped_state(){' "$runner" 2>/dev/null &&
     grep -Fq -- 'command -v logger' "$runner" 2>/dev/null &&
+    grep -Fq -- '没有可用证书指纹时不能写 skipped' "$runner" 2>/dev/null &&
+    grep -Fqx -- '    result=failed' "$runner" 2>/dev/null &&
     grep -Fqx -- '    write_skipped_state "$current_fingerprint"' "$runner" 2>/dev/null &&
     grep -Fqx -- 'runner_config_uses_store(){' "$runner" 2>/dev/null &&
     grep -Fqx -- '        store_owner=$(sed -n '\''s/^owner=//p'\'' "$store_meta" 2>/dev/null | head -n 1)' "$runner" 2>/dev/null &&
@@ -314,17 +316,25 @@ log_renewal_warning(){
   fi
 }
 
-# 跳过本次续期时写 canonical skipped 状态（保持 last_renewal_epoch 不变）。
+# 跳过本次续期时写 canonical 状态（保持 last_renewal_epoch 不变）。
+# 没有可用证书指纹时不能写 skipped（加载器要求 skipped 带指纹），改记 failed/exit 1。
 write_skipped_state(){
-  local fingerprint=$1 check_epoch state_tmp
+  local fingerprint=$1 check_epoch state_tmp result exit_code
+  if [[ -n $fingerprint ]]; then
+    result=skipped
+    exit_code=0
+  else
+    result=failed
+    exit_code=1
+  fi
   check_epoch=$(date +%s) || return 1
   state_tmp=$(mktemp "$state_dir/.acme_renew.state.XXXXXX") || return 1
   trap 'rm -f -- "$state_tmp"' EXIT
   trap 'exit 1' HUP INT TERM
   if ! printf '%s\n' \
     "last_check_epoch=$check_epoch" \
-    "last_result=skipped" \
-    "last_exit_code=0" \
+    "last_result=$result" \
+    "last_exit_code=$exit_code" \
     "last_renewal_epoch=$last_renewal_epoch" \
     "cert_fingerprint=$fingerprint" > "$state_tmp" ||
      ! chmod 600 "$state_tmp" ||

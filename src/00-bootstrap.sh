@@ -24,8 +24,8 @@ ACME_RELOAD="$STATE_DIR/reload.sh"
 ACME_LOCK="/run/acme-nginx.lock"
 ACME_RENEW_RUNNER="$STATE_DIR/renew.sh"
 ACME_RENEW_STATE="$STATE_DIR/renew.state"
-ACME_RELOAD_IDENTITY="# acme-nginx-reload-v4"
-ACME_RENEW_IDENTITY="# acme-nginx-renew-v5"
+ACME_RELOAD_IDENTITY="# acme-nginx-reload-v5"
+ACME_RENEW_IDENTITY="# acme-nginx-renew-v6"
 ACME_CRON_MARKER="# acme-nginx-managed"
 ACME_LOCK_FD=
 ACME_LOCK_HELD=0
@@ -50,7 +50,7 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-acme_nginx_version="v0.7.0"
+acme_nginx_version="v0.7.1"
 
 valid_ipv4(){
   local ip=$1 IFS=. octets octet
@@ -277,7 +277,10 @@ load_config(){
   source=${source:-own}
   [[ $source == own || $source == store ]] || return 1
   store_dir=${store_dir:-/etc/cert-store}
-  [[ $store_dir =~ ^/[A-Za-z0-9._/-]{1,200}$ && $store_dir != */../* ]] || return 1
+  if ! valid_store_root "$store_dir"; then
+    red "配置错误：STORE_DIR 必须是干净的绝对路径（无引号/空白/..，且不以 / 结尾）：$store_dir"
+    return 1
+  fi
   normalize_acme_domain "$domain" || return 1
   DNS_PROVIDER=$provider
   CF_ACCOUNT_ID=

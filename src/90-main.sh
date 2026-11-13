@@ -120,7 +120,8 @@ cmd_renew(){
         red "无法在共享证书库锁内交还续期责任，请检查 $STORE_DIR"
         return 1
       fi
-      if ! with_acme_lock issue_certificate; then
+      # 已先 store_force_owner_none 清空 owner，接管是显式意图：跳过 claim 的存活检查。
+      if ! with_acme_lock issue_certificate 0 1; then
         red "接管续期失败，请检查凭据后重试"
         return 1
       fi
@@ -195,7 +196,8 @@ cmd_force_renew(){
       return 1
     fi
     green "正在强制重新签发当前证书……"
-    if ! with_acme_lock issue_certificate 1; then
+    # 已先 store_force_owner_none 清空 owner，强制接管是显式意图：跳过 claim 的存活检查。
+    if ! with_acme_lock issue_certificate 1 1; then
       red "强制重签失败，请查看上方 acme.sh 输出"
       return 1
     fi

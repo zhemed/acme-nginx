@@ -50,7 +50,7 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-acme_nginx_version="v0.6.2"
+acme_nginx_version="v0.6.3"
 
 valid_ipv4(){
   local ip=$1 IFS=. octets octet

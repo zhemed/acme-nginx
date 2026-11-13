@@ -132,7 +132,7 @@ bash tests/verify.sh
 
 ## 固定版本
 
-- 当前版本：0.6.2
+- 当前版本：0.6.3
 - acme.sh 固定为 `3.1.4`
 - 上游下载仅 HTTPS，并在执行前核对项目内固定的 SHA-256
 - 签发服务：Let's Encrypt（acme-v02）

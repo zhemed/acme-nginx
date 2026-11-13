@@ -33,6 +33,7 @@ cmd_install(){
   install_official_acme || return 1
   green "acme.sh v${ACME_VERSION} 安装完成"
   ensure_sb_restart_post_hook || true
+  ensure_shared_cert_store_published || true
 }
 
 cmd_issue(){
@@ -45,10 +46,12 @@ cmd_issue(){
     return 1
   fi
   prepare_state_dir || { red "初始化状态目录失败：$STATE_DIR"; return 1; }
+  ensure_shared_cert_store_published || true
   if store_mode; then
     if store_certificate_is_adoptable; then
       adopt_store_certificate || return 1
       ensure_sb_restart_post_hook || true
+  ensure_shared_cert_store_published || true
       return 0
     fi
     store_owner_value=$(store_owner 2>/dev/null || true)
@@ -76,6 +79,7 @@ cmd_issue(){
     return 1
   fi
   ensure_sb_restart_post_hook || true
+  ensure_shared_cert_store_published || true
   if ! with_acme_lock setup_acme_renew_cron; then
     yellow "证书已签发，但自动续期任务设置失败，请检查 root crontab 与 cron 服务"
   else

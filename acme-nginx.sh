@@ -50,7 +50,7 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-acme_nginx_version="v0.6.0"
+acme_nginx_version="v0.6.1"
 
 valid_ipv4(){
   local ip=$1 IFS=. octets octet
@@ -1524,6 +1524,96 @@ store_release_ownership(){
   done
 }
 
+publish_own_certificate_to_store(){
+  local root dir generations gen current meta_tmp fingerprint not_after alt identity now old_current current_target generation enddate epoch cert key
+  root=$(store_root) || return 1
+  identity=$(read_acme_identity 2>/dev/null) || return 1
+  load_certificate_metadata "$ACME_CERT" "$ACME_KEY" || return 1
+  [[ $CERT_META_STATE == valid ]] || return 1
+  cert=$ACME_CERT
+  key=$ACME_KEY
+  [[ -L $cert ]] && cert=$(readlink -f -- "$cert")
+  [[ -L $key ]] && key=$(readlink -f -- "$key")
+  [[ -f $cert && -f $key ]] || return 1
+  if [[ -e $root || -L $root ]]; then
+    [[ -d $root && ! -L $root ]] || return 1
+  else
+    mkdir "$root" || return 1
+    chmod 700 "$root" || return 1
+  fi
+  dir="$root/$identity"
+  if [[ -e $dir || -L $dir ]]; then
+    [[ -d $dir && ! -L $dir ]] || return 1
+  else
+    mkdir "$dir" || return 1
+    chmod 700 "$dir" || return 1
+  fi
+  generations="$dir/generations"
+  if [[ -e $generations || -L $generations ]]; then
+    [[ -d $generations && ! -L $generations ]] || return 1
+  else
+    mkdir "$generations" || return 1
+    chmod 700 "$generations" || return 1
+  fi
+  gen=$(mktemp -d "$generations/gen.XXXXXX") || return 1
+  chmod 700 "$gen" || return 1
+  cp -- "$cert" "$gen/fullchain.pem" || return 1
+  cp -- "$key" "$gen/private.key" || return 1
+  chmod 600 "$gen/fullchain.pem" "$gen/private.key" || return 1
+  fingerprint=$(sha256sum "$gen/fullchain.pem" | awk '{print $1}') || return 1
+  [[ $fingerprint =~ ^[0-9a-f]{64}$ ]] || return 1
+  not_after=0
+  if enddate=$(openssl x509 -in "$gen/fullchain.pem" -noout -enddate 2>/dev/null); then
+    epoch=$(date -d "${enddate#notAfter=}" +%s 2>/dev/null) && not_after=$epoch
+  fi
+  alt=
+  if openssl x509 -in "$gen/fullchain.pem" -noout -text 2>/dev/null |
+       grep -qE "DNS:\*\.$identity([,[:space:]]|$)"; then
+    alt="*.$identity"
+  fi
+  old_current=$(readlink "$dir/current" 2>/dev/null || true)
+  current=$(mktemp "$dir/.current.XXXXXX") || return 1
+  rm -f -- "$current" || return 1
+  ln -s -- "generations/${gen##*/}" "$current" || return 1
+  mv -Tf -- "$current" "$dir/current" || return 1
+  now=$(date +%s) || return 1
+  meta_tmp=$(mktemp "$dir/.meta.XXXXXX") || return 1
+  if ! printf '%s\n' \
+    "version=1" "domain=$identity" "alt=$alt" "owner=acme-nginx" \
+    "issuer=letsencrypt" "issued_at=$now" "not_after=$not_after" \
+    "fingerprint=$fingerprint" "updated_at=$now" "updated_by=acme-nginx" > "$meta_tmp" ||
+     ! chmod 600 "$meta_tmp" || ! mv -Tf -- "$meta_tmp" "$dir/meta.env"; then
+    rm -f -- "$meta_tmp"
+    if [[ -n $old_current ]]; then
+      current=$(mktemp "$dir/.current.XXXXXX") || return 1
+      rm -f -- "$current"
+      ln -s -- "$old_current" "$current" && mv -Tf -- "$current" "$dir/current"
+    else
+      rm -f -- "$dir/current"
+    fi
+    rm -rf -- "$gen"
+    return 1
+  fi
+  current_target=$(readlink "$dir/current" 2>/dev/null || true)
+  for generation in "$generations"/gen.*; do
+    [[ -e $generation || -L $generation ]] || continue
+    [[ $generation == "$dir/$current_target" ]] && continue
+    rm -rf -- "$generation" || true
+  done
+}
+
+# 干净机器首次签发后自动创建共享库并发布当前证书（不重新签发）。
+ensure_shared_cert_store_published(){
+  local root
+  root=$(store_root) || return 0
+  [[ -d $root && ! -L $root ]] && return 0
+  read_acme_identity >/dev/null 2>&1 || return 0
+  load_certificate_metadata "$ACME_CERT" "$ACME_KEY" 2>/dev/null || return 0
+  [[ $CERT_META_STATE == valid ]] || return 0
+  publish_own_certificate_to_store >/dev/null 2>&1 || return 0
+  yellow "已自动创建共享证书库并发布当前证书（owner: acme-nginx）"
+}
+
 issue_certificate(){
   local -a issue_args
   local provider plugin current_identity
@@ -2161,6 +2251,7 @@ cmd_install(){
   install_official_acme || return 1
   green "acme.sh v${ACME_VERSION} 安装完成"
   ensure_sb_restart_post_hook || true
+  ensure_shared_cert_store_published || true
 }
 
 cmd_issue(){
@@ -2173,10 +2264,12 @@ cmd_issue(){
     return 1
   fi
   prepare_state_dir || { red "初始化状态目录失败：$STATE_DIR"; return 1; }
+  ensure_shared_cert_store_published || true
   if store_mode; then
     if store_certificate_is_adoptable; then
       adopt_store_certificate || return 1
       ensure_sb_restart_post_hook || true
+  ensure_shared_cert_store_published || true
       return 0
     fi
     store_owner_value=$(store_owner 2>/dev/null || true)
@@ -2204,6 +2297,7 @@ cmd_issue(){
     return 1
   fi
   ensure_sb_restart_post_hook || true
+  ensure_shared_cert_store_published || true
   if ! with_acme_lock setup_acme_renew_cron; then
     yellow "证书已签发，但自动续期任务设置失败，请检查 root crontab 与 cron 服务"
   else

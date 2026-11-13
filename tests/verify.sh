@@ -34,12 +34,12 @@ grep -Fq -- 'https://codeload.github.com/acmesh-official/acme.sh/tar.gz/refs/tag
 if grep -Fq -- '--install-online' "$ROOT_DIR/acme-nginx.sh"; then
   fail "unverified acme.sh online installer remains"
 fi
-[[ $(grep -Fxc 'acme_nginx_version="v0.6.0"' "$ROOT_DIR/acme-nginx.sh" || true) -eq 1 ]] ||
-  fail "script version is not 0.6.0"
-[[ $(tr -d '\r\n' < "$ROOT_DIR/VERSION") == '0.6.0' ]] ||
-  fail "VERSION file is not 0.6.0"
-grep -Fq -- "当前版本：0.6.0" "$ROOT_DIR/README.md" ||
-  fail "README project version is not 0.6.0"
+[[ $(grep -Fxc 'acme_nginx_version="v0.6.1"' "$ROOT_DIR/acme-nginx.sh" || true) -eq 1 ]] ||
+  fail "script version is not 0.6.1"
+[[ $(tr -d '\r\n' < "$ROOT_DIR/VERSION") == '0.6.1' ]] ||
+  fail "VERSION file is not 0.6.1"
+grep -Fq -- "当前版本：0.6.1" "$ROOT_DIR/README.md" ||
+  fail "README project version is not 0.6.1"
 
 for store_pattern in \
   'CERT_SOURCE=store' \

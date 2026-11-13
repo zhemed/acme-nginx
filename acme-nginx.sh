@@ -50,7 +50,7 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-acme_nginx_version="v0.4.0"
+acme_nginx_version="v0.4.1"
 
 valid_ipv4(){
   local ip=$1 IFS=. octets octet
@@ -179,8 +179,8 @@ write_config_template(){
     printf '%s\n' 'STAGING=0'
     printf '%s\n' '# 主域名（必填）'
     printf '%s\n' 'DOMAIN='
-    printf '%s\n' '# 是否同时申请泛域名证书：1 表示同时签 *.DOMAIN'
-    printf '%s\n' 'WILDCARD=0'
+    printf '%s\n' '# 是否同时申请泛域名证书：1（默认）同时签 *.DOMAIN；0 只申请单域名'
+    printf '%s\n' 'WILDCARD=1'
     printf '%s\n' '# 证书来源：own=本工具签发；store=领养 /etc/cert-store 共享证书库（与 sb 共用）'
     printf '%s\n' 'CERT_SOURCE=own'
     printf '%s\n' '# 共享证书库目录（CERT_SOURCE=store 时使用）'

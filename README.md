@@ -56,7 +56,7 @@ DNS_PROVIDER=cloudflare
 CF_ACCOUNT_ID=0123456789abcdef0123456789abcdef
 CF_TOKEN=你的CloudflareAPIToken
 DOMAIN=example.com
-WILDCARD=1        # 1 表示同时申请 *.example.com，0 只申请单域名
+WILDCARD=1        # 默认 1：DOMAIN=example.com 时同时申请 example.com + *.example.com；0 只申请单域名
 ```
 
 - `DNS_PROVIDER`：DNS 供应商，`cloudflare` 或 `huaweicloud`，默认 `cloudflare`。
@@ -132,7 +132,7 @@ bash tests/verify.sh
 
 ## 固定版本
 
-- 当前版本：0.4.0
+- 当前版本：0.4.1
 - acme.sh 固定为 `3.1.4`
 - 上游下载仅 HTTPS，并在执行前核对项目内固定的 SHA-256
 - 签发服务：Let's Encrypt（acme-v02）

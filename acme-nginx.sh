@@ -24,8 +24,8 @@ ACME_RELOAD="$STATE_DIR/reload.sh"
 ACME_LOCK="/run/acme-nginx.lock"
 ACME_RENEW_RUNNER="$STATE_DIR/renew.sh"
 ACME_RENEW_STATE="$STATE_DIR/renew.state"
-ACME_RELOAD_IDENTITY="# acme-nginx-reload-v2"
-ACME_RENEW_IDENTITY="# acme-nginx-renew-v2"
+ACME_RELOAD_IDENTITY="# acme-nginx-reload-v3"
+ACME_RENEW_IDENTITY="# acme-nginx-renew-v4"
 ACME_CRON_MARKER="# acme-nginx-managed"
 ACME_LOCK_FD=
 ACME_LOCK_HELD=0
@@ -50,7 +50,7 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-acme_nginx_version="v0.6.4"
+acme_nginx_version="v0.6.5"
 
 valid_ipv4(){
   local ip=$1 IFS=. octets octet
@@ -896,7 +896,7 @@ write_acme_reload_hook(){
 #!/bin/bash
 # Signal handlers and EXIT cleanup functions are invoked indirectly by Bash.
 # shellcheck disable=SC2317,SC2329
-# acme-nginx-reload-v2
+# acme-nginx-reload-v3
 export LANG=en_US.UTF-8
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 base="/etc/acme-nginx"
@@ -1050,19 +1050,20 @@ store_publish(){
   [[ -d $store_root && ! -L $store_root ]] || return 0
   [[ $identity =~ ^[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9]$ ]] || return 0
   store_dir="$store_root/$identity"
-  if [[ -f $store_dir/meta.env && ! -L $store_dir/meta.env ]]; then
-    owner=$(sed -n 's/^owner=//p' "$store_dir/meta.env" 2>/dev/null | head -n 1)
-    case $owner in
-      acme-nginx|none|'') ;;
-      *) return 0 ;;
-    esac
-  fi
   (
     set -u
     umask 077
     exec 7> "$store_root/.lock" || exit 1
     chmod 600 "$store_root/.lock" || exit 1
     flock -w 30 7 || exit 1
+    # owner 判定必须在锁内：与接管方改写 meta 的窗口期错开，避免把别人的证书覆盖掉。
+    if [[ -f $store_dir/meta.env && ! -L $store_dir/meta.env ]]; then
+      owner=$(sed -n 's/^owner=//p' "$store_dir/meta.env" 2>/dev/null | head -n 1)
+      case $owner in
+        acme-nginx|none|'') ;;
+        *) exit 0 ;;
+      esac
+    fi
     if [[ -e $store_dir || -L $store_dir ]]; then
       [[ -d $store_dir && ! -L $store_dir ]] || exit 1
     else
@@ -1323,9 +1324,11 @@ if ! nginx_service_active; then
   finalize_deployment
   exit 0
 fi
+# 先发布共享证书库再 reload：store 模式下 nginx 引用的是库里的 current，顺序反了会加载上一代证书。
+store_publish "$identity" || true
 if reload_nginx; then
   commit_deployment
-  finalize_deployment
+  run_post_reload_hook
   exit 0
 fi
 rollback_deployment || true
@@ -1356,11 +1359,13 @@ acme_reload_hook_is_current(){
     grep -Fqx 'source_key="$source_dir/private.key"' "$ACME_RELOAD" 2>/dev/null &&
     grep -Fqx 'deployment_started=1' "$ACME_RELOAD" 2>/dev/null &&
     grep -Fqx '    restore_managed_links=1' "$ACME_RELOAD" 2>/dev/null &&
+    grep -Fqx 'store_publish "$identity" || true' "$ACME_RELOAD" 2>/dev/null &&
     grep -Fqx 'if reload_nginx; then' "$ACME_RELOAD" 2>/dev/null &&
     grep -Fqx 'store_root="/etc/cert-store"' "$ACME_RELOAD" 2>/dev/null &&
     grep -Fqx 'store_publish(){' "$ACME_RELOAD" 2>/dev/null &&
     grep -Fqx 'finalize_deployment(){' "$ACME_RELOAD" 2>/dev/null &&
-    [[ $(grep -Fxc '  finalize_deployment' "$ACME_RELOAD" 2>/dev/null || true) -eq 2 ]] &&
+    [[ $(grep -Fxc '  finalize_deployment' "$ACME_RELOAD" 2>/dev/null || true) -eq 1 ]] &&
+    [[ $(grep -Fxc '  run_post_reload_hook' "$ACME_RELOAD" 2>/dev/null || true) -eq 2 ]] &&
     grep -Fqx '  commit_deployment' "$ACME_RELOAD" 2>/dev/null &&
     grep -Fqx '  exit 0' "$ACME_RELOAD" 2>/dev/null &&
     grep -Fqx 'rollback_deployment || true' "$ACME_RELOAD" 2>/dev/null &&
@@ -1438,31 +1443,143 @@ store_meta_path(){
   dir=$(store_domain_dir) || return 1
   printf '%s/meta.env\n' "$dir"
 }
-store_owner(){
-  local meta
-  meta=$(store_meta_path) || return 1
-  [[ -f $meta && ! -L $meta ]] || return 1
-  sed -n 's/^owner=//p' "$meta" 2>/dev/null | head -n 1
+store_modes_enforced(){
+  case $(uname -s 2>/dev/null) in
+    MINGW*|MSYS*) return 1 ;;
+    *) return 0 ;;
+  esac
 }
+
+# 共享库目录/文件必须是 root 属主、700/600 的常规文件（Windows 下跳过 mode 检查）。
+store_private_dir(){
+  local path=$1 owner expected_owner mode
+  [[ -d $path && ! -L $path ]] || return 1
+  expected_owner=$(id -u 2>/dev/null) || return 1
+  owner=$(stat -c '%u' "$path" 2>/dev/null) || return 1
+  [[ $owner == "$expected_owner" ]] || return 1
+  store_modes_enforced || return 0
+  mode=$(stat -c '%a' "$path" 2>/dev/null) || return 1
+  [[ $mode == 700 ]]
+}
+
+store_private_file(){
+  local path=$1 owner expected_owner mode
+  [[ -f $path && ! -L $path ]] || return 1
+  expected_owner=$(id -u 2>/dev/null) || return 1
+  owner=$(stat -c '%u' "$path" 2>/dev/null) || return 1
+  [[ $owner == "$expected_owner" ]] || return 1
+  store_modes_enforced || return 0
+  mode=$(stat -c '%a' "$path" 2>/dev/null) || return 1
+  [[ $mode == 600 ]]
+}
+
+# 严格解析 meta.env：恰好 10 个已知字段各一行，值符合契约；解析结果放 STORE_META_*。
+store_read_meta(){
+  local apex=$1 meta line key value
+  local version='' domain='' alt='' owner='' issuer='' issued_at='' not_after=''
+  local fingerprint='' updated_at='' updated_by=''
+  local version_count=0 domain_count=0 alt_count=0 owner_count=0 issuer_count=0
+  local issued_at_count=0 not_after_count=0 fingerprint_count=0 updated_at_count=0
+  local updated_by_count=0
+  export STORE_META_VERSION STORE_META_DOMAIN STORE_META_ALT STORE_META_OWNER \
+    STORE_META_ISSUER STORE_META_ISSUED_AT STORE_META_NOT_AFTER \
+    STORE_META_FINGERPRINT STORE_META_UPDATED_AT STORE_META_UPDATED_BY
+  STORE_META_VERSION=
+  STORE_META_DOMAIN=
+  STORE_META_ALT=
+  STORE_META_OWNER=
+  STORE_META_ISSUER=
+  STORE_META_ISSUED_AT=
+  STORE_META_NOT_AFTER=
+  STORE_META_FINGERPRINT=
+  STORE_META_UPDATED_AT=
+  STORE_META_UPDATED_BY=
+  [[ $apex == "${apex,,}" ]] || return 1
+  valid_hostname "$apex" || return 1
+  meta=$(store_meta_path) || return 1
+  store_private_file "$meta" || return 1
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ -n $line && $line == *=* ]] || return 1
+    key=${line%%=*}
+    value=${line#*=}
+    case $key in
+      version) version=$value; version_count=$((version_count + 1)) ;;
+      domain) domain=$value; domain_count=$((domain_count + 1)) ;;
+      alt) alt=$value; alt_count=$((alt_count + 1)) ;;
+      owner) owner=$value; owner_count=$((owner_count + 1)) ;;
+      issuer) issuer=$value; issuer_count=$((issuer_count + 1)) ;;
+      issued_at) issued_at=$value; issued_at_count=$((issued_at_count + 1)) ;;
+      not_after) not_after=$value; not_after_count=$((not_after_count + 1)) ;;
+      fingerprint) fingerprint=$value; fingerprint_count=$((fingerprint_count + 1)) ;;
+      updated_at) updated_at=$value; updated_at_count=$((updated_at_count + 1)) ;;
+      updated_by) updated_by=$value; updated_by_count=$((updated_by_count + 1)) ;;
+      *) return 1 ;;
+    esac
+  done < "$meta"
+  ((version_count == 1 && domain_count == 1 && alt_count == 1 && owner_count == 1 &&
+    issuer_count == 1 && issued_at_count == 1 && not_after_count == 1 &&
+    fingerprint_count == 1 && updated_at_count == 1 && updated_by_count == 1)) || return 1
+  [[ $version == 1 ]] || return 1
+  [[ $domain == "$apex" ]] || return 1
+  [[ -z $alt || $alt == "*.$apex" ]] || return 1
+  case $owner in
+    sb|acme-nginx|none) ;;
+    *) return 1 ;;
+  esac
+  [[ $issuer =~ ^[A-Za-z0-9._-]{1,32}$ ]] || return 1
+  [[ $issued_at =~ ^[0-9]{1,12}$ && $not_after =~ ^[0-9]{1,12}$ &&
+     $updated_at =~ ^[0-9]{1,12}$ ]] || return 1
+  [[ $fingerprint =~ ^[0-9a-f]{64}$ ]] || return 1
+  case $updated_by in
+    sb|acme-nginx) ;;
+    *) return 1 ;;
+  esac
+  STORE_META_VERSION=$version
+  STORE_META_DOMAIN=$domain
+  STORE_META_ALT=$alt
+  STORE_META_OWNER=$owner
+  STORE_META_ISSUER=$issuer
+  STORE_META_ISSUED_AT=$issued_at
+  STORE_META_NOT_AFTER=$not_after
+  STORE_META_FINGERPRINT=$fingerprint
+  STORE_META_UPDATED_AT=$updated_at
+  STORE_META_UPDATED_BY=$updated_by
+}
+
+store_owner(){
+  [[ -n ${ACME_PRIMARY_DOMAIN:-} ]] || return 1
+  store_read_meta "$ACME_PRIMARY_DOMAIN" >/dev/null || return 1
+  printf '%s\n' "$STORE_META_OWNER"
+}
+
+# 领养前的完整契约校验：目录/权限/meta 字段/current 指针/证书内容全部通过才可领养。
 store_certificate_is_adoptable(){
-  local dir cert key fingerprint
+  local dir cert key current generation fingerprint
   store_mode || return 1
+  [[ -n ${ACME_PRIMARY_DOMAIN:-} ]] || return 1
   dir=$(store_domain_dir) || return 1
-  [[ -d $dir && ! -L $dir && -L $dir/current ]] || return 1
-  cert="$dir/current/fullchain.pem"
-  key="$dir/current/private.key"
-  [[ -f $cert && -f $key ]] || return 1
+  store_private_dir "$(store_root)" || return 1
+  store_private_dir "$dir" || return 1
+  store_read_meta "$ACME_PRIMARY_DOMAIN" || return 1
+  [[ $STORE_META_ALT == "${ACME_WILDCARD_DOMAIN:-}" ]] || return 1
+  [[ -L $dir/current ]] || return 1
+  current=$(readlink "$dir/current" 2>/dev/null) || return 1
+  [[ $current =~ ^generations/gen\.[A-Za-z0-9]+$ ]] || return 1
+  generation="$dir/$current"
+  store_private_dir "$generation" || return 1
+  cert="$generation/fullchain.pem"
+  key="$generation/private.key"
+  store_private_file "$cert" || return 1
+  store_private_file "$key" || return 1
   load_certificate_metadata "$cert" "$key" || return 1
   [[ $CERT_META_STATE == valid ]] || return 1
   certificate_covers_configured_domains "$cert" || return 1
   certificate_time_valid "$cert" || return 1
   certificate_key_matches "$cert" "$key" || return 1
-  if [[ -f $dir/meta.env && ! -L $dir/meta.env ]]; then
-    fingerprint=$(sha256sum "$cert" 2>/dev/null | awk '{print $1}') || return 1
-    [[ $(sed -n 's/^fingerprint=//p' "$dir/meta.env" | head -n 1) == "$fingerprint" ]] || return 1
-  fi
-  STORE_CERT=$cert
-  STORE_KEY=$key
+  fingerprint=$(sha256sum "$cert" 2>/dev/null | awk '{print $1}') || return 1
+  [[ ${fingerprint,,} == "${STORE_META_FINGERPRINT,,}" ]] || return 1
+  STORE_CERT="$dir/current/fullchain.pem"
+  STORE_KEY="$dir/current/private.key"
 }
 adopt_store_certificate(){
   local owner
@@ -1925,7 +2042,7 @@ acme_renew_state_path(){
 }
 
 acme_renew_runner_identity(){
-  printf '%s\n' "${ACME_RENEW_IDENTITY:-# acme-nginx-renew-v2}"
+  printf '%s\n' "${ACME_RENEW_IDENTITY:-# acme-nginx-renew-v4}"
 }
 
 # Parsed values are consumed by the certificate management module.
@@ -2075,8 +2192,13 @@ acme_renew_runner_is_current(){
     grep -Fqx -- 'exec 9> "$lock_file" || exit 1' "$runner" 2>/dev/null &&
     grep -Fqx -- 'if ! flock -n 9; then' "$runner" 2>/dev/null &&
     grep -Fqx -- 'acme_identity=$(read_runner_acme_identity) || exit 1' "$runner" 2>/dev/null &&
+    grep -Fqx -- '  if exec 8> "$store_root/.lock"; then' "$runner" 2>/dev/null &&
+    grep -Fqx -- '    if chmod 600 "$store_root/.lock" && flock -w 5 8; then' "$runner" 2>/dev/null &&
+    grep -Fqx -- '  store_lock_ok=0' "$runner" 2>/dev/null &&
+    grep -Fqx -- '  if [[ $store_lock_ok -ne 1 ]]; then' "$runner" 2>/dev/null &&
+    grep -Fq -- '共享证书库锁获取失败，跳过本次续期' "$runner" 2>/dev/null &&
     grep -Fqx -- 'runner_config_uses_store(){' "$runner" 2>/dev/null &&
-    grep -Fqx -- '  store_owner=$(sed -n '\''s/^owner=//p'\'' "$store_meta" 2>/dev/null | head -n 1)' "$runner" 2>/dev/null &&
+    grep -Fqx -- '        store_owner=$(sed -n '\''s/^owner=//p'\'' "$store_meta" 2>/dev/null | head -n 1)' "$runner" 2>/dev/null &&
     grep -Fqx -- 'state_read_epoch=$(date +%s) || exit 1' "$runner" 2>/dev/null &&
     grep -Fqx -- '  if [[ -n $previous_renewal ]] && ((previous_renewal <= state_read_epoch)); then' "$runner" 2>/dev/null &&
     grep -Fqx -- "$expected_cron_command" "$runner" 2>/dev/null &&
@@ -2179,11 +2301,29 @@ if [[ -f $state_file && ! -L $state_file ]]; then
 fi
 
 before_fingerprint=$(certificate_fingerprint || true)
+# owner 读取在 store 锁内短暂完成（flock -w 5，读完即放），避免与发布方改写 meta 的窗口期
+# 读到半截状态。锁顺序固定为 ACME 锁 → store 锁。
 store_meta="$store_root/$acme_identity/meta.env"
-if [[ -d $store_root && ! -L $store_root &&
-      -f $store_meta && ! -L $store_meta ]]; then
-  store_owner=$(sed -n 's/^owner=//p' "$store_meta" 2>/dev/null | head -n 1)
-  if [[ -n $store_owner && $store_owner != acme-nginx ]]; then
+store_owner=
+if [[ -d $store_root && ! -L $store_root ]]; then
+  store_lock_ok=0
+  if exec 8> "$store_root/.lock"; then
+    if chmod 600 "$store_root/.lock" && flock -w 5 8; then
+      store_lock_ok=1
+      if [[ -f $store_meta && ! -L $store_meta ]]; then
+        store_owner=$(sed -n 's/^owner=//p' "$store_meta" 2>/dev/null | head -n 1)
+      fi
+      flock -u 8 >/dev/null 2>&1 || true
+    fi
+    exec 8>&-
+  fi
+  # 锁失败时无法确认 owner：跳过本次续期（fail-closed），避免与 owner 并发签发。
+  if [[ $store_lock_ok -ne 1 ]]; then
+    echo "acme-nginx: 共享证书库锁获取失败，跳过本次续期（无法确认续期负责人）" >&2
+    exit 0
+  fi
+fi
+if [[ -n $store_owner && $store_owner != acme-nginx ]]; then
     if ! runner_config_uses_store; then
       echo "acme-nginx: 共享证书库 owner 为 $store_owner，但本机 CERT_SOURCE 不是 store；继续续期本机证书" >&2
     else
@@ -2205,7 +2345,6 @@ if [[ -d $store_root && ! -L $store_root &&
       trap - EXIT HUP INT TERM
       exit 0
     fi
-  fi
 fi
 if ((force)); then
   HOME="$state_dir" "$acme_bin" --home "$acme_home" --config-home "$acme_home" --renew -d "$acme_identity" --ecc --force
@@ -2413,6 +2552,13 @@ cmd_issue(){
   fi
   ensure_sb_restart_post_hook || true
   ensure_shared_cert_store_published || true
+  if store_mode; then
+    store_owner_value=$(store_owner 2>/dev/null || true)
+    if [[ $store_owner_value != acme-nginx ]]; then
+      red "证书已签发，但共享证书库 owner 未写回 acme-nginx（owner: ${store_owner_value:-未知}），自动续期未安装"
+      return 1
+    fi
+  fi
   if ! with_acme_lock setup_acme_renew_cron; then
     yellow "证书已签发，但自动续期任务设置失败，请检查 root crontab 与 cron 服务"
   else
@@ -2450,6 +2596,7 @@ cmd_renew(){
         red "接管续期失败，请检查凭据后重试"
         return 1
       fi
+      ensure_sb_restart_post_hook || true
       ensure_shared_cert_store_published || true
       store_owner_value=$(store_owner 2>/dev/null || true)
       if [[ $store_owner_value != acme-nginx ]]; then

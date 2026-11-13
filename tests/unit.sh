@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016  # generated hook/runner text is matched literally
 set -Eeuo pipefail
 
 export LC_ALL=C
@@ -68,10 +69,10 @@ export ACME_GENERATIONS="$ACME_LIVE/generations"
 export ACME_CURRENT="$ACME_LIVE/current"
 export ACME_LOCK="$STATE_DIR/acme.lock"
 export ACME_CRON_MARKER="# acme-nginx-managed"
-export ACME_RELOAD_IDENTITY="# acme-nginx-reload-v2"
+export ACME_RELOAD_IDENTITY="# acme-nginx-reload-v3"
 export CERT_SOURCE=own
 export STORE_DIR=/etc/cert-store
-export ACME_RENEW_IDENTITY="# acme-nginx-renew-v2"
+export ACME_RENEW_IDENTITY="# acme-nginx-renew-v4"
 export ACME_VERSION="3.1.4"
 export ACME_ARCHIVE_SHA256="e5f8e187bbf5251e0cd8891f2622daab9850366bd17bea9f92c2fe2ee091fd32"
 export ACME_RENEW_RUNNER="$STATE_DIR/renew.sh"
@@ -508,6 +509,27 @@ runner_renews_own_cert_when_config_is_own(){
 expect_success "ACME runner renews its own certificate when the store owner is another tool but CERT_SOURCE=own" \
   runner_renews_own_cert_when_config_is_own
 pass "own-mode renewal is not skipped because another tool owns the shared store"
+
+runner_fails_closed_when_store_lock_is_unavailable(){
+  (
+    local store="$TEMP_DIR/runner-lock-fail-store" marker="$TEMP_DIR/runner-lock-fail-called"
+    local output
+    printf '%s\n' 'example.com' > "$ACME_IDENTITY"
+    rm -rf "$store" "$marker"
+    mkdir -p "$store" && chmod 700 "$store" || return 1
+    # 用目录占住锁文件位置，模拟锁获取失败（无法确认 owner 时必须跳过本次）。
+    mkdir "$store/.lock" || return 1
+    printf '%s\n' '#!/bin/bash' ": > '$marker'" 'exit 0' > "$ACME_BIN"
+    chmod 700 "$ACME_BIN"
+    STORE_DIR="$store" write_acme_renew_runner || return 1
+    output=$("$ACME_RENEW_RUNNER" 2>&1) || return 1
+    [[ ! -e $marker ]] || return 1
+    [[ $output == *'共享证书库锁获取失败'* ]]
+  )
+}
+expect_success "ACME runner fails closed when the shared store lock is unavailable" \
+  runner_fails_closed_when_store_lock_is_unavailable
+pass "store lock failure skips the run and warns instead of renewing blindly"
 printf 'CERT_SOURCE=own\n' > "$CONFIG_FILE"
 write_acme_renew_runner || fail "failed to restore the canonical renewal runner"
 
@@ -979,3 +1001,127 @@ store_release_ownership_uses_store_lock(){
 expect_success "store ownership release runs under the shared store lock" \
   store_release_ownership_uses_store_lock
 pass "store lock file is private and release is idempotent"
+
+# --- v0.6.5：reload hook 先发布 store 再 reload；owner 判定在 store 锁内 ---
+reload_hook_publishes_store_before_reload(){
+  (
+    local hook="$ACME_RELOAD" publish_prev flock_line owner_line reload_line
+    write_acme_reload_hook || return 1
+    reload_line=$(grep -n '^if reload_nginx; then' "$hook" | head -n 1 | cut -d: -f1)
+    flock_line=$(grep -n 'flock -w 30 7 || exit 1' "$hook" | head -n 1 | cut -d: -f1)
+    owner_line=$(grep -n 'owner=$(sed -n' "$hook" | head -n 1 | cut -d: -f1)
+    [[ -n $reload_line && -n $flock_line && -n $owner_line ]] || return 1
+    ((reload_line > 1)) || return 1
+    # 必须是 reload 语句的“上一行”发布（函数体内也有一处相同文本，不能用第一个匹配）。
+    publish_prev=$(sed -n "$((reload_line - 1))p" "$hook")
+    [[ $publish_prev == 'store_publish "$identity" || true' ]] || return 1
+    ((flock_line < owner_line))
+  )
+}
+expect_success "reload hook publishes the shared store before reloading nginx" \
+  reload_hook_publishes_store_before_reload
+pass "store publish happens before nginx reload and owner checks are inside the store lock"
+
+renew_runner_reads_store_owner_under_lock(){
+  (
+    write_acme_renew_runner || return 1
+    # shellcheck disable=SC2016  # generated runner text is matched literally
+    grep -Fq '  if exec 8> "$store_root/.lock"; then' "$ACME_RENEW_RUNNER" || return 1
+    grep -Fq 'flock -w 5 8' "$ACME_RENEW_RUNNER" || return 1
+    grep -Fq 'flock -u 8' "$ACME_RENEW_RUNNER" || return 1
+    # shellcheck disable=SC2016  # generated runner text is matched literally
+    grep -Fq 'if [[ -n $store_owner && $store_owner != acme-nginx ]]; then' \
+      "$ACME_RENEW_RUNNER"
+  )
+}
+expect_success "renew runner reads the store owner under a short store lock" \
+  renew_runner_reads_store_owner_under_lock
+pass "non-owner skip semantics are unchanged"
+
+# --- v0.6.5：领养校验矩阵（D）---
+write_adoptable_store_fixture(){
+  local store=$1 dir fp now
+  rm -rf "$store"
+  dir="$store/example.com"
+  mkdir -p "$dir/generations/gen.ABC123" || return 1
+  chmod 700 "$store" "$dir" "$dir/generations" "$dir/generations/gen.ABC123" || return 1
+  cp -p "$CERT_DIR/cert.pem" "$dir/generations/gen.ABC123/fullchain.pem" || return 1
+  cp -p "$CERT_DIR/key.pem" "$dir/generations/gen.ABC123/private.key" || return 1
+  chmod 600 "$dir/generations/gen.ABC123/fullchain.pem" \
+    "$dir/generations/gen.ABC123/private.key" || return 1
+  ln -s generations/gen.ABC123 "$dir/current" || return 1
+  fp=$(sha256sum "$CERT_DIR/cert.pem" | awk '{print $1}') || return 1
+  now=$(date +%s) || return 1
+  printf 'version=1\ndomain=example.com\nalt=\nowner=acme-nginx\nissuer=letsencrypt\nissued_at=%s\nnot_after=%s\nfingerprint=%s\nupdated_at=%s\nupdated_by=acme-nginx\n' \
+    "$now" "$now" "$fp" "$now" > "$dir/meta.env" || return 1
+  chmod 600 "$dir/meta.env"
+}
+
+store_adoption_matrix_is_strict(){
+  (
+    local store="$TEMP_DIR/store-adopt-matrix" dir meta_bak
+    CERT_SOURCE=store
+    STORE_DIR="$store"
+    ACME_PRIMARY_DOMAIN=example.com
+    ACME_WILDCARD_DOMAIN=
+    write_adoptable_store_fixture "$store" || return 1
+    store_certificate_is_adoptable || return 1
+    dir="$store/example.com"
+    meta_bak="$TEMP_DIR/store-adopt-meta.bak"
+    cp -p "$dir/meta.env" "$meta_bak" || return 1
+    restore_meta(){ cp -p "$meta_bak" "$dir/meta.env" && chmod 600 "$dir/meta.env"; }
+    # meta 缺失
+    rm -f "$dir/meta.env"
+    ! store_certificate_is_adoptable || return 1
+    restore_meta || return 1
+    # version/domain/owner/时间戳/指纹格式
+    sed -i 's/^version=1$/version=2/' "$dir/meta.env" && chmod 600 "$dir/meta.env"
+    ! store_certificate_is_adoptable || return 1
+    restore_meta || return 1
+    sed -i 's/^domain=example.com$/domain=other.com/' "$dir/meta.env" && chmod 600 "$dir/meta.env"
+    ! store_certificate_is_adoptable || return 1
+    restore_meta || return 1
+    sed -i 's/^owner=acme-nginx$/owner=other/' "$dir/meta.env" && chmod 600 "$dir/meta.env"
+    ! store_certificate_is_adoptable || return 1
+    restore_meta || return 1
+    sed -i 's/^not_after=.*/not_after=not-a-time/' "$dir/meta.env" && chmod 600 "$dir/meta.env"
+    ! store_certificate_is_adoptable || return 1
+    restore_meta || return 1
+    sed -i 's/^fingerprint=.*/fingerprint=zzzz/' "$dir/meta.env" && chmod 600 "$dir/meta.env"
+    ! store_certificate_is_adoptable || return 1
+    restore_meta || return 1
+    sed -i 's/^fingerprint=.*/fingerprint=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/' \
+      "$dir/meta.env" && chmod 600 "$dir/meta.env"
+    ! store_certificate_is_adoptable || return 1
+    restore_meta || return 1
+    # alt 与 WILDCARD 不一致
+    sed -i 's/^alt=$/alt=*.example.com/' "$dir/meta.env" && chmod 600 "$dir/meta.env"
+    ! store_certificate_is_adoptable || return 1
+    restore_meta || return 1
+    # 权限错误：root/域名目录 755、meta 644
+    chmod 755 "$store"
+    ! store_certificate_is_adoptable || return 1
+    chmod 700 "$store"
+    chmod 755 "$dir"
+    ! store_certificate_is_adoptable || return 1
+    chmod 700 "$dir"
+    chmod 644 "$dir/meta.env"
+    ! store_certificate_is_adoptable || return 1
+    chmod 600 "$dir/meta.env"
+    # current 非法 / cert 为符号链接
+    ln -sfn 'generations/bad-name' "$dir/current"
+    ! store_certificate_is_adoptable || return 1
+    ln -sfn 'generations/gen.ABC123' "$dir/current"
+    rm -f "$dir/generations/gen.ABC123/fullchain.pem"
+    ln -s "$CERT_DIR/cert.pem" "$dir/generations/gen.ABC123/fullchain.pem"
+    ! store_certificate_is_adoptable || return 1
+    rm -f "$dir/generations/gen.ABC123/fullchain.pem"
+    cp -p "$CERT_DIR/cert.pem" "$dir/generations/gen.ABC123/fullchain.pem"
+    chmod 600 "$dir/generations/gen.ABC123/fullchain.pem"
+    # 恢复后仍可领养
+    store_certificate_is_adoptable
+  )
+}
+expect_success "store adoption enforces the full metadata/permission/layout contract" \
+  store_adoption_matrix_is_strict
+pass "missing or malformed meta, wrong permissions and invalid current are all refused"

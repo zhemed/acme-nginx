@@ -80,6 +80,13 @@ cmd_issue(){
   fi
   ensure_sb_restart_post_hook || true
   ensure_shared_cert_store_published || true
+  if store_mode; then
+    store_owner_value=$(store_owner 2>/dev/null || true)
+    if [[ $store_owner_value != acme-nginx ]]; then
+      red "证书已签发，但共享证书库 owner 未写回 acme-nginx（owner: ${store_owner_value:-未知}），自动续期未安装"
+      return 1
+    fi
+  fi
   if ! with_acme_lock setup_acme_renew_cron; then
     yellow "证书已签发，但自动续期任务设置失败，请检查 root crontab 与 cron 服务"
   else
@@ -117,6 +124,7 @@ cmd_renew(){
         red "接管续期失败，请检查凭据后重试"
         return 1
       fi
+      ensure_sb_restart_post_hook || true
       ensure_shared_cert_store_published || true
       store_owner_value=$(store_owner 2>/dev/null || true)
       if [[ $store_owner_value != acme-nginx ]]; then

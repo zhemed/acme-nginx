@@ -34,12 +34,12 @@ grep -Fq -- 'https://codeload.github.com/acmesh-official/acme.sh/tar.gz/refs/tag
 if grep -Fq -- '--install-online' "$ROOT_DIR/acme-nginx.sh"; then
   fail "unverified acme.sh online installer remains"
 fi
-[[ $(grep -Fxc 'acme_nginx_version="v0.6.4"' "$ROOT_DIR/acme-nginx.sh" || true) -eq 1 ]] ||
-  fail "script version is not 0.6.4"
-[[ $(tr -d '\r\n' < "$ROOT_DIR/VERSION") == '0.6.4' ]] ||
-  fail "VERSION file is not 0.6.4"
-grep -Fq -- "当前版本：0.6.4" "$ROOT_DIR/README.md" ||
-  fail "README project version is not 0.6.4"
+[[ $(grep -Fxc 'acme_nginx_version="v0.6.5"' "$ROOT_DIR/acme-nginx.sh" || true) -eq 1 ]] ||
+  fail "script version is not 0.6.5"
+[[ $(tr -d '\r\n' < "$ROOT_DIR/VERSION") == '0.6.5' ]] ||
+  fail "VERSION file is not 0.6.5"
+grep -Fq -- "当前版本：0.6.5" "$ROOT_DIR/README.md" ||
+  fail "README project version is not 0.6.5"
 
 for store_pattern in \
   'CERT_SOURCE=store' \
@@ -77,7 +77,10 @@ for takeover_pattern in \
   'with_acme_lock issue_certificate 1' \
   '无法在共享证书库锁内交还续期责任' \
   'owner 未写回 acme-nginx' \
-  'nginx 已 reload 并加载共享库中的新证书'; do
+  'nginx 已 reload 并加载共享库中的新证书' \
+  'store_read_meta(){' \
+  'store_private_dir(){' \
+  'store_private_file(){'; do
   grep -Fq -- "$takeover_pattern" "$ROOT_DIR/acme-nginx.sh" ||
     fail "v0.6.4 store takeover support is missing: $takeover_pattern"
 done
@@ -85,6 +88,31 @@ done
 if grep -Fq -- 'grep -FqE' "$ROOT_DIR/acme-nginx.sh"; then
   fail "hook upgrade detection uses the invalid grep -FqE combination"
 fi
+# v0.6.5：hook 先发布 store 再 reload；发布/owner 判定在 store 锁内；runner 短暂持锁读 owner。
+# shellcheck disable=SC2016
+for ordering_pattern in \
+  '# acme-nginx-reload-v3' \
+  '# acme-nginx-renew-v4' \
+  '共享证书库锁获取失败，跳过本次续期（无法确认续期负责人）' \
+  'store_publish "$identity" || true' \
+  '  if exec 8> "$store_root/.lock"; then' \
+  '    if chmod 600 "$store_root/.lock" && flock -w 5 8; then' \
+  'flock -u 8'; do
+  grep -Fq -- "$ordering_pattern" "$ROOT_DIR/acme-nginx.sh" ||
+    fail "v0.6.5 ordering/locking support is missing: $ordering_pattern"
+done
+grep -Fq -- '签发**前**的 owner double-check 尚未实现' "$ROOT_DIR/README.md" ||
+  fail "README does not document the remaining pre-issue double-check gap"
+# 负向门禁：reload hook 必须先发布共享库再 reload，否则 store 模式会加载上一代证书。
+# 断言的是 reload 语句的“上一行”必须是发布语句（finalize_deployment 函数体内也有一处
+# 相同文本，按第一个匹配取行号会得到假门禁）。
+reload_line=$(grep -n '^if reload_nginx; then' "$ROOT_DIR/acme-nginx.sh" | head -n 1 | cut -d: -f1)
+[[ -n $reload_line ]] || fail "reload hook reload sequence is missing"
+((reload_line > 1)) || fail "reload hook publish line is missing"
+publish_prev=$(sed -n "$((reload_line - 1))p" "$ROOT_DIR/acme-nginx.sh")
+# shellcheck disable=SC2016  # literal generated hook text
+[[ $publish_prev == 'store_publish "$identity" || true' ]] ||
+  fail "reload hook must publish to the shared store immediately before reloading nginx"
 
 # shellcheck disable=SC2016
 for pattern in \

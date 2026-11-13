@@ -82,7 +82,7 @@ acme_renew_state_path(){
 }
 
 acme_renew_runner_identity(){
-  printf '%s\n' "${ACME_RENEW_IDENTITY:-# acme-nginx-renew-v2}"
+  printf '%s\n' "${ACME_RENEW_IDENTITY:-# acme-nginx-renew-v4}"
 }
 
 # Parsed values are consumed by the certificate management module.
@@ -232,8 +232,13 @@ acme_renew_runner_is_current(){
     grep -Fqx -- 'exec 9> "$lock_file" || exit 1' "$runner" 2>/dev/null &&
     grep -Fqx -- 'if ! flock -n 9; then' "$runner" 2>/dev/null &&
     grep -Fqx -- 'acme_identity=$(read_runner_acme_identity) || exit 1' "$runner" 2>/dev/null &&
+    grep -Fqx -- '  if exec 8> "$store_root/.lock"; then' "$runner" 2>/dev/null &&
+    grep -Fqx -- '    if chmod 600 "$store_root/.lock" && flock -w 5 8; then' "$runner" 2>/dev/null &&
+    grep -Fqx -- '  store_lock_ok=0' "$runner" 2>/dev/null &&
+    grep -Fqx -- '  if [[ $store_lock_ok -ne 1 ]]; then' "$runner" 2>/dev/null &&
+    grep -Fq -- '共享证书库锁获取失败，跳过本次续期' "$runner" 2>/dev/null &&
     grep -Fqx -- 'runner_config_uses_store(){' "$runner" 2>/dev/null &&
-    grep -Fqx -- '  store_owner=$(sed -n '\''s/^owner=//p'\'' "$store_meta" 2>/dev/null | head -n 1)' "$runner" 2>/dev/null &&
+    grep -Fqx -- '        store_owner=$(sed -n '\''s/^owner=//p'\'' "$store_meta" 2>/dev/null | head -n 1)' "$runner" 2>/dev/null &&
     grep -Fqx -- 'state_read_epoch=$(date +%s) || exit 1' "$runner" 2>/dev/null &&
     grep -Fqx -- '  if [[ -n $previous_renewal ]] && ((previous_renewal <= state_read_epoch)); then' "$runner" 2>/dev/null &&
     grep -Fqx -- "$expected_cron_command" "$runner" 2>/dev/null &&
@@ -336,11 +341,29 @@ if [[ -f $state_file && ! -L $state_file ]]; then
 fi
 
 before_fingerprint=$(certificate_fingerprint || true)
+# owner 读取在 store 锁内短暂完成（flock -w 5，读完即放），避免与发布方改写 meta 的窗口期
+# 读到半截状态。锁顺序固定为 ACME 锁 → store 锁。
 store_meta="$store_root/$acme_identity/meta.env"
-if [[ -d $store_root && ! -L $store_root &&
-      -f $store_meta && ! -L $store_meta ]]; then
-  store_owner=$(sed -n 's/^owner=//p' "$store_meta" 2>/dev/null | head -n 1)
-  if [[ -n $store_owner && $store_owner != acme-nginx ]]; then
+store_owner=
+if [[ -d $store_root && ! -L $store_root ]]; then
+  store_lock_ok=0
+  if exec 8> "$store_root/.lock"; then
+    if chmod 600 "$store_root/.lock" && flock -w 5 8; then
+      store_lock_ok=1
+      if [[ -f $store_meta && ! -L $store_meta ]]; then
+        store_owner=$(sed -n 's/^owner=//p' "$store_meta" 2>/dev/null | head -n 1)
+      fi
+      flock -u 8 >/dev/null 2>&1 || true
+    fi
+    exec 8>&-
+  fi
+  # 锁失败时无法确认 owner：跳过本次续期（fail-closed），避免与 owner 并发签发。
+  if [[ $store_lock_ok -ne 1 ]]; then
+    echo "acme-nginx: 共享证书库锁获取失败，跳过本次续期（无法确认续期负责人）" >&2
+    exit 0
+  fi
+fi
+if [[ -n $store_owner && $store_owner != acme-nginx ]]; then
     if ! runner_config_uses_store; then
       echo "acme-nginx: 共享证书库 owner 为 $store_owner，但本机 CERT_SOURCE 不是 store；继续续期本机证书" >&2
     else
@@ -362,7 +385,6 @@ if [[ -d $store_root && ! -L $store_root &&
       trap - EXIT HUP INT TERM
       exit 0
     fi
-  fi
 fi
 if ((force)); then
   HOME="$state_dir" "$acme_bin" --home "$acme_home" --config-home "$acme_home" --renew -d "$acme_identity" --ecc --force

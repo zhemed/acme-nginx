@@ -71,7 +71,7 @@ export ACME_CRON_MARKER="# acme-nginx-managed"
 export ACME_RELOAD_IDENTITY="# acme-nginx-reload-v2"
 export CERT_SOURCE=own
 export STORE_DIR=/etc/cert-store
-export ACME_RENEW_IDENTITY="# acme-nginx-renew-v1"
+export ACME_RENEW_IDENTITY="# acme-nginx-renew-v2"
 export ACME_VERSION="3.1.4"
 export ACME_ARCHIVE_SHA256="e5f8e187bbf5251e0cd8891f2622daab9850366bd17bea9f92c2fe2ee091fd32"
 export ACME_RENEW_RUNNER="$STATE_DIR/renew.sh"
@@ -460,6 +460,56 @@ grep -Fq "$ACME_RENEW_IDENTITY" "$ACME_RENEW_RUNNER" || fail "runner identity mi
 pass "runner identity present"
 bash -n "$ACME_RENEW_RUNNER" || fail "runner passes bash -n"
 pass "runner passes bash -n"
+
+runner_skips_when_config_uses_store(){
+  (
+    local store="$TEMP_DIR/runner-store" marker="$TEMP_DIR/runner-called"
+    printf '%s\n' 'example.com' > "$ACME_IDENTITY"
+    rm -rf "$store"
+    mkdir -p "$store/example.com"
+    chmod 700 "$store" "$store/example.com"
+    printf 'owner=sb\n' > "$store/example.com/meta.env"
+    chmod 600 "$store/example.com/meta.env"
+    printf 'CERT_SOURCE=store\n' > "$CONFIG_FILE"
+    rm -f "$marker"
+    printf '%s\n' '#!/bin/bash' ": > '$marker'" 'exit 0' > "$ACME_BIN"
+    chmod 700 "$ACME_BIN"
+    STORE_DIR="$store" write_acme_renew_runner || return 1
+    "$ACME_RENEW_RUNNER" || return 1
+    [[ ! -e $marker ]] || return 1
+    load_acme_renew_state || return 1
+    [[ $ACME_RENEW_LAST_RESULT == skipped ]]
+  )
+}
+expect_success "ACME runner skips renewal only when CERT_SOURCE=store and the owner is another tool" \
+  runner_skips_when_config_uses_store
+pass "non-owner runner defers only in store mode"
+
+runner_renews_own_cert_when_config_is_own(){
+  (
+    local store="$TEMP_DIR/runner-store-own" marker="$TEMP_DIR/runner-called-own"
+    printf '%s\n' 'example.com' > "$ACME_IDENTITY"
+    rm -rf "$store"
+    mkdir -p "$store/example.com"
+    chmod 700 "$store" "$store/example.com"
+    printf 'owner=sb\n' > "$store/example.com/meta.env"
+    chmod 600 "$store/example.com/meta.env"
+    printf 'CERT_SOURCE=own\n' > "$CONFIG_FILE"
+    rm -f "$marker"
+    printf '%s\n' '#!/bin/bash' ": > '$marker'" 'exit 0' > "$ACME_BIN"
+    chmod 700 "$ACME_BIN"
+    STORE_DIR="$store" write_acme_renew_runner || return 1
+    "$ACME_RENEW_RUNNER" || return 1
+    [[ -e $marker ]] || return 1
+    load_acme_renew_state || return 1
+    [[ $ACME_RENEW_LAST_RESULT != skipped ]]
+  )
+}
+expect_success "ACME runner renews its own certificate when the store owner is another tool but CERT_SOURCE=own" \
+  runner_renews_own_cert_when_config_is_own
+pass "own-mode renewal is not skipped because another tool owns the shared store"
+printf 'CERT_SOURCE=own\n' > "$CONFIG_FILE"
+write_acme_renew_runner || fail "failed to restore the canonical renewal runner"
 
 # --- cron entry ---
 expected_cron=$(acme_renew_cron_entry)

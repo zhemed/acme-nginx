@@ -34,12 +34,12 @@ grep -Fq -- 'https://codeload.github.com/acmesh-official/acme.sh/tar.gz/refs/tag
 if grep -Fq -- '--install-online' "$ROOT_DIR/acme-nginx.sh"; then
   fail "unverified acme.sh online installer remains"
 fi
-[[ $(grep -Fxc 'acme_nginx_version="v0.6.1"' "$ROOT_DIR/acme-nginx.sh" || true) -eq 1 ]] ||
-  fail "script version is not 0.6.1"
-[[ $(tr -d '\r\n' < "$ROOT_DIR/VERSION") == '0.6.1' ]] ||
-  fail "VERSION file is not 0.6.1"
-grep -Fq -- "当前版本：0.6.1" "$ROOT_DIR/README.md" ||
-  fail "README project version is not 0.6.1"
+[[ $(grep -Fxc 'acme_nginx_version="v0.6.2"' "$ROOT_DIR/acme-nginx.sh" || true) -eq 1 ]] ||
+  fail "script version is not 0.6.2"
+[[ $(tr -d '\r\n' < "$ROOT_DIR/VERSION") == '0.6.2' ]] ||
+  fail "VERSION file is not 0.6.2"
+grep -Fq -- "当前版本：0.6.2" "$ROOT_DIR/README.md" ||
+  fail "README project version is not 0.6.2"
 
 for store_pattern in \
   'CERT_SOURCE=store' \
@@ -138,6 +138,27 @@ for pattern in '--install' 'nginx-etc-backup-' 'sites-enabled' 'modules-enabled'
 done
 grep -Fq -- '--install' "$ROOT_DIR/DEPLOY.md" || fail "DEPLOY.md does not document --install"
 grep -Fq -- '--install' "$ROOT_DIR/nginx/README.md" || fail "nginx/README.md does not document --install"
+
+# --- 共享证书库：CLI 发布函数与 reload hook 发布函数的契约一致性 ---
+store_main_body=$(awk '/^publish_own_certificate_to_store\(\)\{/{inside=1} inside{print} inside&&/^}/{exit}' "$ROOT_DIR/acme-nginx.sh")
+store_main_body+=$'\n'$(awk '/^publish_own_certificate_to_store_locked\(\)\{/{inside=1} inside{print} inside&&/^}/{exit}' "$ROOT_DIR/acme-nginx.sh")
+store_hook_body=$(awk '/^store_publish\(\)\{/{inside=1} inside{print} inside&&/^}/{exit}' "$ROOT_DIR/acme-nginx.sh")
+[[ -n $store_main_body && -n $store_hook_body ]] ||
+  fail "shared store publish implementations are missing"
+store_main_fields=$(printf '%s\n' "$store_main_body" | grep -oE '"[a-z_]+=[^"]*"' | sed 's/^"//; s/=.*//' | sort -u)
+store_hook_fields=$(printf '%s\n' "$store_hook_body" | grep -oE '"[a-z_]+=[^"]*"' | sed 's/^"//; s/=.*//' | sort -u)
+[[ -n $store_main_fields && "$store_main_fields" == "$store_hook_fields" ]] ||
+  fail "shared store meta field sets diverged between CLI and reload hook"
+for marker in 'flock -w 30' 'mv -Tf' 'chmod 600' 'rm -rf'; do
+  printf '%s\n' "$store_main_body" | grep -Fq -- "$marker" ||
+    fail "CLI store publish lost: $marker"
+  printf '%s\n' "$store_hook_body" | grep -Fq -- "$marker" ||
+    fail "reload hook store publish lost: $marker"
+done
+grep -Fq 'sb) [[ -s /etc/sb/sb.json && -s /etc/sb/acme_server_name ]] ;;' "$ROOT_DIR/acme-nginx.sh" ||
+  fail "sb owner liveness regressed to service state"
+grep -Fq 'runner_config_uses_store(){' "$ROOT_DIR/acme-nginx.sh" ||
+  fail "renew runner lost its store-mode check"
 
 bash "$ROOT_DIR/tests/unit.sh"
 

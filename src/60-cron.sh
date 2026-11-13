@@ -82,7 +82,7 @@ acme_renew_state_path(){
 }
 
 acme_renew_runner_identity(){
-  printf '%s\n' "${ACME_RENEW_IDENTITY:-# acme-nginx-renew-v1}"
+  printf '%s\n' "${ACME_RENEW_IDENTITY:-# acme-nginx-renew-v2}"
 }
 
 # Parsed values are consumed by the certificate management module.
@@ -201,6 +201,7 @@ acme_renew_runner_is_current(){
   expected_cron_command="  HOME=\"\$state_dir\" \"\$acme_bin\" --cron --home \"\$acme_home\" --config-home \"\$acme_home\""
   expected_force_command="  HOME=\"\$state_dir\" \"\$acme_bin\" --home \"\$acme_home\" --config-home \"\$acme_home\" --renew -d \"\$acme_identity\" --ecc --force"
   printf -v expected_state_dir 'state_dir=%q' "$STATE_DIR"
+  printf -v expected_config_file 'config_file=%q' "$CONFIG_FILE"
   printf -v expected_acme_bin 'acme_bin=%q' "$ACME_BIN"
   printf -v expected_acme_home 'acme_home=%q' "$ACME_HOME"
   printf -v expected_cert_file 'cert_file=%q' "${ACME_CERT:-$STATE_DIR/fullchain.pem}"
@@ -218,6 +219,7 @@ acme_renew_runner_is_current(){
   # shellcheck disable=SC2016
   [[ $(grep -Fxc -- "$identity" "$runner" 2>/dev/null || true) -eq 1 ]] &&
     grep -Fqx -- "$expected_state_dir" "$runner" 2>/dev/null &&
+    grep -Fqx -- "$expected_config_file" "$runner" 2>/dev/null &&
     grep -Fqx -- "$expected_acme_bin" "$runner" 2>/dev/null &&
     grep -Fqx -- "$expected_acme_home" "$runner" 2>/dev/null &&
     grep -Fqx -- "$expected_cert_file" "$runner" 2>/dev/null &&
@@ -230,6 +232,7 @@ acme_renew_runner_is_current(){
     grep -Fqx -- 'exec 9> "$lock_file" || exit 1' "$runner" 2>/dev/null &&
     grep -Fqx -- 'if ! flock -n 9; then' "$runner" 2>/dev/null &&
     grep -Fqx -- 'acme_identity=$(read_runner_acme_identity) || exit 1' "$runner" 2>/dev/null &&
+    grep -Fqx -- 'runner_config_uses_store(){' "$runner" 2>/dev/null &&
     grep -Fqx -- '  store_owner=$(sed -n '\''s/^owner=//p'\'' "$store_meta" 2>/dev/null | head -n 1)' "$runner" 2>/dev/null &&
     grep -Fqx -- 'state_read_epoch=$(date +%s) || exit 1' "$runner" 2>/dev/null &&
     grep -Fqx -- '  if [[ -n $previous_renewal ]] && ((previous_renewal <= state_read_epoch)); then' "$runner" 2>/dev/null &&
@@ -254,6 +257,7 @@ write_acme_renew_runner(){
   if ! {
     printf '%s\n' '#!/bin/bash' "$identity" 'set -u' 'umask 077'
     printf 'state_dir=%q\n' "$STATE_DIR"
+    printf 'config_file=%q\n' "$CONFIG_FILE"
     printf 'acme_bin=%q\n' "$ACME_BIN"
     printf 'acme_home=%q\n' "$ACME_HOME"
     printf 'cert_file=%q\n' "${ACME_CERT:-$STATE_DIR/fullchain.pem}"
@@ -293,6 +297,14 @@ read_runner_acme_identity(){
   printf '%s\n' "$identity"
 }
 
+# 只有本机 CERT_SOURCE=store 时，才把续期让给共享库 owner。
+runner_config_uses_store(){
+  local source
+  [[ -s $config_file ]] || return 1
+  source=$(sed -n 's/^CERT_SOURCE=//p' "$config_file" 2>/dev/null | tail -n 1)
+  [[ ${source:-own} == store ]]
+}
+
 force=0
 case $# in
   0) ;;
@@ -329,23 +341,27 @@ if [[ -d $store_root && ! -L $store_root &&
       -f $store_meta && ! -L $store_meta ]]; then
   store_owner=$(sed -n 's/^owner=//p' "$store_meta" 2>/dev/null | head -n 1)
   if [[ -n $store_owner && $store_owner != acme-nginx ]]; then
-    current_fingerprint=$(certificate_fingerprint || true)
-    check_epoch=$(date +%s) || exit 1
-    state_tmp=$(mktemp "$state_dir/.acme_renew.state.XXXXXX") || exit 1
-    trap 'rm -f -- "$state_tmp"' EXIT
-    trap 'exit 1' HUP INT TERM
-    if ! printf '%s\n' \
-      "last_check_epoch=$check_epoch" \
-      "last_result=skipped" \
-      "last_exit_code=0" \
-      "last_renewal_epoch=$last_renewal_epoch" \
-      "cert_fingerprint=$current_fingerprint" > "$state_tmp" ||
-       ! chmod 600 "$state_tmp" ||
-       ! mv -fT -- "$state_tmp" "$state_file"; then
-      exit 1
+    if ! runner_config_uses_store; then
+      echo "acme-nginx: 共享证书库 owner 为 $store_owner，但本机 CERT_SOURCE 不是 store；继续续期本机证书" >&2
+    else
+      current_fingerprint=$(certificate_fingerprint || true)
+      check_epoch=$(date +%s) || exit 1
+      state_tmp=$(mktemp "$state_dir/.acme_renew.state.XXXXXX") || exit 1
+      trap 'rm -f -- "$state_tmp"' EXIT
+      trap 'exit 1' HUP INT TERM
+      if ! printf '%s\n' \
+        "last_check_epoch=$check_epoch" \
+        "last_result=skipped" \
+        "last_exit_code=0" \
+        "last_renewal_epoch=$last_renewal_epoch" \
+        "cert_fingerprint=$current_fingerprint" > "$state_tmp" ||
+         ! chmod 600 "$state_tmp" ||
+         ! mv -fT -- "$state_tmp" "$state_file"; then
+        exit 1
+      fi
+      trap - EXIT HUP INT TERM
+      exit 0
     fi
-    trap - EXIT HUP INT TERM
-    exit 0
   fi
 fi
 if ((force)); then

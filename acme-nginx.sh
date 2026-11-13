@@ -25,7 +25,7 @@ ACME_LOCK="/run/acme-nginx.lock"
 ACME_RENEW_RUNNER="$STATE_DIR/renew.sh"
 ACME_RENEW_STATE="$STATE_DIR/renew.state"
 ACME_RELOAD_IDENTITY="# acme-nginx-reload-v2"
-ACME_RENEW_IDENTITY="# acme-nginx-renew-v1"
+ACME_RENEW_IDENTITY="# acme-nginx-renew-v2"
 ACME_CRON_MARKER="# acme-nginx-managed"
 ACME_LOCK_FD=
 ACME_LOCK_HELD=0
@@ -50,7 +50,7 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-acme_nginx_version="v0.6.1"
+acme_nginx_version="v0.6.2"
 
 valid_ipv4(){
   local ip=$1 IFS=. octets octet
@@ -1478,17 +1478,46 @@ adopt_store_certificate(){
   return 0
 }
 
-# 检测到本机 sb 服务时，自动创建证书部署后的重启钩子（不覆盖已有自定义钩子）。
+# 检测到本机 sb 服务时，自动创建证书部署后的重启钩子（不覆盖自定义钩子；自动创建的钩子会随内容升级重写）。
 ensure_sb_restart_post_hook(){
   local hook="$STATE_DIR/post_reload.sh" tmp
-  [[ -e $hook || -L $hook ]] && return 0
   command -v systemctl >/dev/null 2>&1 || return 0
   [[ -d /run/systemd/system ]] || return 0
   systemctl cat sb >/dev/null 2>&1 || return 0
   tmp=$(mktemp "$STATE_DIR/.post_reload.XXXXXX") || return 1
-  if ! printf '%s\n' '#!/bin/bash' '# acme-nginx-managed sb restart hook (auto-created)' \
-       'systemctl restart sb' > "$tmp" ||
-     ! chmod 700 "$tmp" || ! mv -fT -- "$tmp" "$hook"; then
+  if ! cat > "$tmp" <<'HOOK'
+#!/bin/bash
+# shared-cert-store peer hook v2 (auto-created): restart sb when it uses the shared cert
+cfg=/etc/sb/sb.json
+command -v jq >/dev/null 2>&1 || exit 0
+[[ -r $cfg ]] || exit 0
+cert=$(jq -r '[.inbounds[] | select(.type=="hysteria2") | .tls.certificate_path] | first // empty' "$cfg" 2>/dev/null) || exit 0
+case $cert in /etc/cert-store/*) systemctl restart sb ;; esac
+HOOK
+  then
+    rm -f "$tmp"
+    return 1
+  fi
+  if ! chmod 700 "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  if [[ -e $hook || -L $hook ]]; then
+    if [[ ! -f $hook || -L $hook ]]; then
+      rm -f "$tmp"
+      return 0
+    fi
+    if grep -Fq -- 'shared-cert-store peer hook' "$hook" 2>/dev/null; then
+      if cmp -s -- "$tmp" "$hook"; then
+        rm -f "$tmp"
+        return 0
+      fi
+    else
+      rm -f "$tmp"
+      return 0
+    fi
+  fi
+  if ! mv -fT -- "$tmp" "$hook"; then
     rm -f "$tmp"
     return 1
   fi
@@ -1497,7 +1526,8 @@ ensure_sb_restart_post_hook(){
 store_owner_present(){
   case ${1-} in
     acme-nginx) return 0 ;;
-    sb) [[ -s /etc/sb/sb.json ]] && systemctl is-active --quiet sb 2>/dev/null ;;
+    # sb 只要仍安装且持有 ACME 身份就算存活；服务临时停机不代表 owner 失效（P2）。
+    sb) [[ -s /etc/sb/sb.json && -s /etc/sb/acme_server_name ]] ;;
     *) return 1 ;;
   esac
 }
@@ -1525,8 +1555,26 @@ store_release_ownership(){
 }
 
 publish_own_certificate_to_store(){
-  local root dir generations gen current meta_tmp fingerprint not_after alt identity now old_current current_target generation enddate epoch cert key
+  local root
   root=$(store_root) || return 1
+  if [[ -e $root || -L $root ]]; then
+    [[ -d $root && ! -L $root ]] || return 1
+  else
+    mkdir "$root" || return 1
+    chmod 700 "$root" || return 1
+  fi
+  (
+    set -u
+    umask 077
+    exec 7> "$root/.lock" || exit 1
+    chmod 600 "$root/.lock" || exit 1
+    flock -w 30 7 || exit 1
+    publish_own_certificate_to_store_locked "$root"
+  )
+}
+
+publish_own_certificate_to_store_locked(){
+  local root=$1 dir generations gen current meta_tmp fingerprint not_after alt identity now old_current current_target generation enddate epoch cert key
   identity=$(read_acme_identity 2>/dev/null) || return 1
   load_certificate_metadata "$ACME_CERT" "$ACME_KEY" || return 1
   [[ $CERT_META_STATE == valid ]] || return 1
@@ -1826,7 +1874,7 @@ acme_renew_state_path(){
 }
 
 acme_renew_runner_identity(){
-  printf '%s\n' "${ACME_RENEW_IDENTITY:-# acme-nginx-renew-v1}"
+  printf '%s\n' "${ACME_RENEW_IDENTITY:-# acme-nginx-renew-v2}"
 }
 
 # Parsed values are consumed by the certificate management module.
@@ -1945,6 +1993,7 @@ acme_renew_runner_is_current(){
   expected_cron_command="  HOME=\"\$state_dir\" \"\$acme_bin\" --cron --home \"\$acme_home\" --config-home \"\$acme_home\""
   expected_force_command="  HOME=\"\$state_dir\" \"\$acme_bin\" --home \"\$acme_home\" --config-home \"\$acme_home\" --renew -d \"\$acme_identity\" --ecc --force"
   printf -v expected_state_dir 'state_dir=%q' "$STATE_DIR"
+  printf -v expected_config_file 'config_file=%q' "$CONFIG_FILE"
   printf -v expected_acme_bin 'acme_bin=%q' "$ACME_BIN"
   printf -v expected_acme_home 'acme_home=%q' "$ACME_HOME"
   printf -v expected_cert_file 'cert_file=%q' "${ACME_CERT:-$STATE_DIR/fullchain.pem}"
@@ -1962,6 +2011,7 @@ acme_renew_runner_is_current(){
   # shellcheck disable=SC2016
   [[ $(grep -Fxc -- "$identity" "$runner" 2>/dev/null || true) -eq 1 ]] &&
     grep -Fqx -- "$expected_state_dir" "$runner" 2>/dev/null &&
+    grep -Fqx -- "$expected_config_file" "$runner" 2>/dev/null &&
     grep -Fqx -- "$expected_acme_bin" "$runner" 2>/dev/null &&
     grep -Fqx -- "$expected_acme_home" "$runner" 2>/dev/null &&
     grep -Fqx -- "$expected_cert_file" "$runner" 2>/dev/null &&
@@ -1974,6 +2024,7 @@ acme_renew_runner_is_current(){
     grep -Fqx -- 'exec 9> "$lock_file" || exit 1' "$runner" 2>/dev/null &&
     grep -Fqx -- 'if ! flock -n 9; then' "$runner" 2>/dev/null &&
     grep -Fqx -- 'acme_identity=$(read_runner_acme_identity) || exit 1' "$runner" 2>/dev/null &&
+    grep -Fqx -- 'runner_config_uses_store(){' "$runner" 2>/dev/null &&
     grep -Fqx -- '  store_owner=$(sed -n '\''s/^owner=//p'\'' "$store_meta" 2>/dev/null | head -n 1)' "$runner" 2>/dev/null &&
     grep -Fqx -- 'state_read_epoch=$(date +%s) || exit 1' "$runner" 2>/dev/null &&
     grep -Fqx -- '  if [[ -n $previous_renewal ]] && ((previous_renewal <= state_read_epoch)); then' "$runner" 2>/dev/null &&
@@ -1998,6 +2049,7 @@ write_acme_renew_runner(){
   if ! {
     printf '%s\n' '#!/bin/bash' "$identity" 'set -u' 'umask 077'
     printf 'state_dir=%q\n' "$STATE_DIR"
+    printf 'config_file=%q\n' "$CONFIG_FILE"
     printf 'acme_bin=%q\n' "$ACME_BIN"
     printf 'acme_home=%q\n' "$ACME_HOME"
     printf 'cert_file=%q\n' "${ACME_CERT:-$STATE_DIR/fullchain.pem}"
@@ -2037,6 +2089,14 @@ read_runner_acme_identity(){
   printf '%s\n' "$identity"
 }
 
+# 只有本机 CERT_SOURCE=store 时，才把续期让给共享库 owner。
+runner_config_uses_store(){
+  local source
+  [[ -s $config_file ]] || return 1
+  source=$(sed -n 's/^CERT_SOURCE=//p' "$config_file" 2>/dev/null | tail -n 1)
+  [[ ${source:-own} == store ]]
+}
+
 force=0
 case $# in
   0) ;;
@@ -2073,23 +2133,27 @@ if [[ -d $store_root && ! -L $store_root &&
       -f $store_meta && ! -L $store_meta ]]; then
   store_owner=$(sed -n 's/^owner=//p' "$store_meta" 2>/dev/null | head -n 1)
   if [[ -n $store_owner && $store_owner != acme-nginx ]]; then
-    current_fingerprint=$(certificate_fingerprint || true)
-    check_epoch=$(date +%s) || exit 1
-    state_tmp=$(mktemp "$state_dir/.acme_renew.state.XXXXXX") || exit 1
-    trap 'rm -f -- "$state_tmp"' EXIT
-    trap 'exit 1' HUP INT TERM
-    if ! printf '%s\n' \
-      "last_check_epoch=$check_epoch" \
-      "last_result=skipped" \
-      "last_exit_code=0" \
-      "last_renewal_epoch=$last_renewal_epoch" \
-      "cert_fingerprint=$current_fingerprint" > "$state_tmp" ||
-       ! chmod 600 "$state_tmp" ||
-       ! mv -fT -- "$state_tmp" "$state_file"; then
-      exit 1
+    if ! runner_config_uses_store; then
+      echo "acme-nginx: 共享证书库 owner 为 $store_owner，但本机 CERT_SOURCE 不是 store；继续续期本机证书" >&2
+    else
+      current_fingerprint=$(certificate_fingerprint || true)
+      check_epoch=$(date +%s) || exit 1
+      state_tmp=$(mktemp "$state_dir/.acme_renew.state.XXXXXX") || exit 1
+      trap 'rm -f -- "$state_tmp"' EXIT
+      trap 'exit 1' HUP INT TERM
+      if ! printf '%s\n' \
+        "last_check_epoch=$check_epoch" \
+        "last_result=skipped" \
+        "last_exit_code=0" \
+        "last_renewal_epoch=$last_renewal_epoch" \
+        "cert_fingerprint=$current_fingerprint" > "$state_tmp" ||
+         ! chmod 600 "$state_tmp" ||
+         ! mv -fT -- "$state_tmp" "$state_file"; then
+        exit 1
+      fi
+      trap - EXIT HUP INT TERM
+      exit 0
     fi
-    trap - EXIT HUP INT TERM
-    exit 0
   fi
 fi
 if ((force)); then
@@ -2269,7 +2333,6 @@ cmd_issue(){
     if store_certificate_is_adoptable; then
       adopt_store_certificate || return 1
       ensure_sb_restart_post_hook || true
-  ensure_shared_cert_store_published || true
       return 0
     fi
     store_owner_value=$(store_owner 2>/dev/null || true)

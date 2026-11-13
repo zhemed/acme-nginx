@@ -1163,17 +1163,46 @@ adopt_store_certificate(){
   return 0
 }
 
-# 检测到本机 sb 服务时，自动创建证书部署后的重启钩子（不覆盖已有自定义钩子）。
+# 检测到本机 sb 服务时，自动创建证书部署后的重启钩子（不覆盖自定义钩子；自动创建的钩子会随内容升级重写）。
 ensure_sb_restart_post_hook(){
   local hook="$STATE_DIR/post_reload.sh" tmp
-  [[ -e $hook || -L $hook ]] && return 0
   command -v systemctl >/dev/null 2>&1 || return 0
   [[ -d /run/systemd/system ]] || return 0
   systemctl cat sb >/dev/null 2>&1 || return 0
   tmp=$(mktemp "$STATE_DIR/.post_reload.XXXXXX") || return 1
-  if ! printf '%s\n' '#!/bin/bash' '# acme-nginx-managed sb restart hook (auto-created)' \
-       'systemctl restart sb' > "$tmp" ||
-     ! chmod 700 "$tmp" || ! mv -fT -- "$tmp" "$hook"; then
+  if ! cat > "$tmp" <<'HOOK'
+#!/bin/bash
+# shared-cert-store peer hook v2 (auto-created): restart sb when it uses the shared cert
+cfg=/etc/sb/sb.json
+command -v jq >/dev/null 2>&1 || exit 0
+[[ -r $cfg ]] || exit 0
+cert=$(jq -r '[.inbounds[] | select(.type=="hysteria2") | .tls.certificate_path] | first // empty' "$cfg" 2>/dev/null) || exit 0
+case $cert in /etc/cert-store/*) systemctl restart sb ;; esac
+HOOK
+  then
+    rm -f "$tmp"
+    return 1
+  fi
+  if ! chmod 700 "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  if [[ -e $hook || -L $hook ]]; then
+    if [[ ! -f $hook || -L $hook ]]; then
+      rm -f "$tmp"
+      return 0
+    fi
+    if grep -Fq -- 'shared-cert-store peer hook' "$hook" 2>/dev/null; then
+      if cmp -s -- "$tmp" "$hook"; then
+        rm -f "$tmp"
+        return 0
+      fi
+    else
+      rm -f "$tmp"
+      return 0
+    fi
+  fi
+  if ! mv -fT -- "$tmp" "$hook"; then
     rm -f "$tmp"
     return 1
   fi
@@ -1182,7 +1211,8 @@ ensure_sb_restart_post_hook(){
 store_owner_present(){
   case ${1-} in
     acme-nginx) return 0 ;;
-    sb) [[ -s /etc/sb/sb.json ]] && systemctl is-active --quiet sb 2>/dev/null ;;
+    # sb 只要仍安装且持有 ACME 身份就算存活；服务临时停机不代表 owner 失效（P2）。
+    sb) [[ -s /etc/sb/sb.json && -s /etc/sb/acme_server_name ]] ;;
     *) return 1 ;;
   esac
 }
@@ -1210,8 +1240,26 @@ store_release_ownership(){
 }
 
 publish_own_certificate_to_store(){
-  local root dir generations gen current meta_tmp fingerprint not_after alt identity now old_current current_target generation enddate epoch cert key
+  local root
   root=$(store_root) || return 1
+  if [[ -e $root || -L $root ]]; then
+    [[ -d $root && ! -L $root ]] || return 1
+  else
+    mkdir "$root" || return 1
+    chmod 700 "$root" || return 1
+  fi
+  (
+    set -u
+    umask 077
+    exec 7> "$root/.lock" || exit 1
+    chmod 600 "$root/.lock" || exit 1
+    flock -w 30 7 || exit 1
+    publish_own_certificate_to_store_locked "$root"
+  )
+}
+
+publish_own_certificate_to_store_locked(){
+  local root=$1 dir generations gen current meta_tmp fingerprint not_after alt identity now old_current current_target generation enddate epoch cert key
   identity=$(read_acme_identity 2>/dev/null) || return 1
   load_certificate_metadata "$ACME_CERT" "$ACME_KEY" || return 1
   [[ $CERT_META_STATE == valid ]] || return 1

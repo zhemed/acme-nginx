@@ -51,7 +51,6 @@ cmd_issue(){
     if store_certificate_is_adoptable; then
       adopt_store_certificate || return 1
       ensure_sb_restart_post_hook || true
-  ensure_shared_cert_store_published || true
       return 0
     fi
     store_owner_value=$(store_owner 2>/dev/null || true)

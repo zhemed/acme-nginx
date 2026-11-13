@@ -25,7 +25,7 @@ ACME_LOCK="/run/acme-nginx.lock"
 ACME_RENEW_RUNNER="$STATE_DIR/renew.sh"
 ACME_RENEW_STATE="$STATE_DIR/renew.state"
 ACME_RELOAD_IDENTITY="# acme-nginx-reload-v2"
-ACME_RENEW_IDENTITY="# acme-nginx-renew-v1"
+ACME_RENEW_IDENTITY="# acme-nginx-renew-v2"
 ACME_CRON_MARKER="# acme-nginx-managed"
 ACME_LOCK_FD=
 ACME_LOCK_HELD=0
@@ -50,7 +50,7 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-acme_nginx_version="v0.6.1"
+acme_nginx_version="v0.6.2"
 
 valid_ipv4(){
   local ip=$1 IFS=. octets octet

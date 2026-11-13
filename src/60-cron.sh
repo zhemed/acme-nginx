@@ -82,7 +82,7 @@ acme_renew_state_path(){
 }
 
 acme_renew_runner_identity(){
-  printf '%s\n' "${ACME_RENEW_IDENTITY:-# acme-nginx-renew-v4}"
+  printf '%s\n' "${ACME_RENEW_IDENTITY:-# acme-nginx-renew-v5}"
 }
 
 # Parsed values are consumed by the certificate management module.
@@ -237,6 +237,10 @@ acme_renew_runner_is_current(){
     grep -Fqx -- '  store_lock_ok=0' "$runner" 2>/dev/null &&
     grep -Fqx -- '  if [[ $store_lock_ok -ne 1 ]]; then' "$runner" 2>/dev/null &&
     grep -Fq -- '共享证书库锁获取失败，跳过本次续期' "$runner" 2>/dev/null &&
+    grep -Fqx -- 'log_renewal_warning(){' "$runner" 2>/dev/null &&
+    grep -Fqx -- 'write_skipped_state(){' "$runner" 2>/dev/null &&
+    grep -Fq -- 'command -v logger' "$runner" 2>/dev/null &&
+    grep -Fqx -- '    write_skipped_state "$current_fingerprint"' "$runner" 2>/dev/null &&
     grep -Fqx -- 'runner_config_uses_store(){' "$runner" 2>/dev/null &&
     grep -Fqx -- '        store_owner=$(sed -n '\''s/^owner=//p'\'' "$store_meta" 2>/dev/null | head -n 1)' "$runner" 2>/dev/null &&
     grep -Fqx -- 'state_read_epoch=$(date +%s) || exit 1' "$runner" 2>/dev/null &&
@@ -302,6 +306,34 @@ read_runner_acme_identity(){
   printf '%s\n' "$identity"
 }
 
+# 有 logger 时同时写系统日志，便于排查锁失败/跳过原因。
+log_renewal_warning(){
+  echo "acme-nginx: $1" >&2
+  if command -v logger >/dev/null 2>&1; then
+    logger -t acme-nginx "$1" 2>/dev/null || true
+  fi
+}
+
+# 跳过本次续期时写 canonical skipped 状态（保持 last_renewal_epoch 不变）。
+write_skipped_state(){
+  local fingerprint=$1 check_epoch state_tmp
+  check_epoch=$(date +%s) || return 1
+  state_tmp=$(mktemp "$state_dir/.acme_renew.state.XXXXXX") || return 1
+  trap 'rm -f -- "$state_tmp"' EXIT
+  trap 'exit 1' HUP INT TERM
+  if ! printf '%s\n' \
+    "last_check_epoch=$check_epoch" \
+    "last_result=skipped" \
+    "last_exit_code=0" \
+    "last_renewal_epoch=$last_renewal_epoch" \
+    "cert_fingerprint=$fingerprint" > "$state_tmp" ||
+     ! chmod 600 "$state_tmp" ||
+     ! mv -fT -- "$state_tmp" "$state_file"; then
+    exit 1
+  fi
+  trap - EXIT HUP INT TERM
+}
+
 # 只有本机 CERT_SOURCE=store 时，才把续期让给共享库 owner。
 runner_config_uses_store(){
   local source
@@ -359,7 +391,9 @@ if [[ -d $store_root && ! -L $store_root ]]; then
   fi
   # 锁失败时无法确认 owner：跳过本次续期（fail-closed），避免与 owner 并发签发。
   if [[ $store_lock_ok -ne 1 ]]; then
-    echo "acme-nginx: 共享证书库锁获取失败，跳过本次续期（无法确认续期负责人）" >&2
+    log_renewal_warning "共享证书库锁获取失败，跳过本次续期（无法确认续期负责人）"
+    current_fingerprint=$(certificate_fingerprint || true)
+    write_skipped_state "$current_fingerprint"
     exit 0
   fi
 fi

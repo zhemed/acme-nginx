@@ -24,8 +24,8 @@ ACME_RELOAD="$STATE_DIR/reload.sh"
 ACME_LOCK="/run/acme-nginx.lock"
 ACME_RENEW_RUNNER="$STATE_DIR/renew.sh"
 ACME_RENEW_STATE="$STATE_DIR/renew.state"
-ACME_RELOAD_IDENTITY="# acme-nginx-reload-v3"
-ACME_RENEW_IDENTITY="# acme-nginx-renew-v4"
+ACME_RELOAD_IDENTITY="# acme-nginx-reload-v4"
+ACME_RENEW_IDENTITY="# acme-nginx-renew-v5"
 ACME_CRON_MARKER="# acme-nginx-managed"
 ACME_LOCK_FD=
 ACME_LOCK_HELD=0
@@ -50,7 +50,7 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-acme_nginx_version="v0.6.5"
+acme_nginx_version="v0.7.0"
 
 valid_ipv4(){
   local ip=$1 IFS=. octets octet
@@ -885,7 +885,9 @@ install_official_acme(){
 }
 
 write_acme_reload_hook(){
-  local hook_tmp
+  local hook_tmp store_root_value
+  store_root_value=$(store_root) || return 1
+  valid_store_root "$store_root_value" || return 1
   hook_tmp=$(mktemp "$STATE_DIR/.acme_reload.XXXXXX") || return 1
   if [[ -e $ACME_RELOAD || -L $ACME_RELOAD ]] && \
      [[ ! -f $ACME_RELOAD || -L $ACME_RELOAD ]]; then
@@ -896,7 +898,7 @@ write_acme_reload_hook(){
 #!/bin/bash
 # Signal handlers and EXIT cleanup functions are invoked indirectly by Bash.
 # shellcheck disable=SC2317,SC2329
-# acme-nginx-reload-v3
+# acme-nginx-reload-v4
 export LANG=en_US.UTF-8
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 base="/etc/acme-nginx"
@@ -1338,11 +1340,24 @@ ACMERELOAD
     rm -f "$hook_tmp"
     return 1
   fi
+  # 把模板里的默认 store_root 换成配置值，并回读确认（失败则丢弃临时 hook）。
+  if ! sed -i "s|^store_root=\"/etc/cert-store\"\$|store_root=\"$store_root_value\"|" "$hook_tmp" ||
+     ! grep -Fqx "store_root=\"$store_root_value\"" "$hook_tmp"; then
+    rm -f "$hook_tmp"
+    return 1
+  fi
   if ! chmod 700 "$hook_tmp" || ! mv -fT -- "$hook_tmp" "$ACME_RELOAD"; then
     rm -f "$hook_tmp"
     return 1
   fi
   acme_reload_hook_is_current
+}
+
+store_root_is_current(){
+  local root
+  root=$(store_root) || return 1
+  valid_store_root "$root" || return 1
+  grep -Fqx "store_root=\"$root\"" "$ACME_RELOAD" 2>/dev/null
 }
 
 acme_reload_hook_is_current(){
@@ -1361,7 +1376,7 @@ acme_reload_hook_is_current(){
     grep -Fqx '    restore_managed_links=1' "$ACME_RELOAD" 2>/dev/null &&
     grep -Fqx 'store_publish "$identity" || true' "$ACME_RELOAD" 2>/dev/null &&
     grep -Fqx 'if reload_nginx; then' "$ACME_RELOAD" 2>/dev/null &&
-    grep -Fqx 'store_root="/etc/cert-store"' "$ACME_RELOAD" 2>/dev/null &&
+    store_root_is_current &&
     grep -Fqx 'store_publish(){' "$ACME_RELOAD" 2>/dev/null &&
     grep -Fqx 'finalize_deployment(){' "$ACME_RELOAD" 2>/dev/null &&
     [[ $(grep -Fxc '  finalize_deployment' "$ACME_RELOAD" 2>/dev/null || true) -eq 1 ]] &&
@@ -1432,6 +1447,15 @@ register_acme_certificate_deployment(){
 # ---- 共享证书库（/etc/cert-store，与 sb 共用）-------------------------------
 store_mode(){ [[ ${CERT_SOURCE:-own} == store ]]; }
 store_root(){ printf '%s\n' "${STORE_DIR:-/etc/cert-store}"; }
+# 共享库根必须是干净的绝对路径：无引号/空白/换行，且不含 .. 组件。
+valid_store_root(){
+  local root=$1
+  [[ ${#root} -ge 2 && ${#root} -le 200 ]] || return 1
+  [[ $root == /* ]] || return 1
+  [[ $root =~ ^/[A-Za-z0-9._/-]+$ ]] || return 1
+  [[ $root != *..* ]] || return 1
+  [[ $root != */ ]] || return 1
+}
 store_domain_dir(){
   local root
   root=$(store_root) || return 1
@@ -1696,6 +1720,71 @@ store_release_ownership(){
   )
 }
 
+# B6 签发前 double-check：store 锁内确认 owner。owner 是其他"存活"工具时返回 2 拒绝；
+# 否则把 owner 置为本工具作为签发占位，原 owner 记录到 STORE_CLAIM_PREVIOUS（供失败回滚）。
+store_claim_issuance(){
+  local self=${1:-acme-nginx} root dir owner output status
+  [[ $self == acme-nginx ]] || return 1
+  root=$(store_root) || return 1
+  valid_store_root "$root" || return 1
+  dir=$(store_domain_dir) || return 1
+  STORE_CLAIM_PREVIOUS=
+  [[ -d $root && ! -L $root ]] || return 0
+  [[ -d $dir && ! -L $dir ]] || return 0
+  [[ -f $dir/meta.env && ! -L $dir/meta.env ]] || return 0
+  output=$(
+    set -u
+    umask 077
+    exec 7> "$root/.lock" || exit 1
+    chmod 600 "$root/.lock" || exit 1
+    flock -w 30 7 || exit 1
+    [[ -f $dir/meta.env && ! -L $dir/meta.env ]] || exit 0
+    owner=$(sed -n 's/^owner=//p' "$dir/meta.env" 2>/dev/null | head -n 1)
+    case $owner in
+      acme-nginx) printf '%s\n' "$owner"; exit 0 ;;
+      ''|none) store_set_owner_locked "$dir" acme-nginx || exit 1 ;;
+      *)
+        if store_owner_present "$owner"; then
+          exit 2
+        fi
+        store_set_owner_locked "$dir" acme-nginx || exit 1
+        ;;
+    esac
+    printf '%s\n' "$owner"
+    exit 0
+  )
+  status=$?
+  if [[ $status -eq 0 ]]; then
+    STORE_CLAIM_PREVIOUS=$output
+  fi
+  return "$status"
+}
+
+# 签发失败/取消时回滚占位：只有 owner 仍是本工具时才恢复原 owner。
+store_release_claim(){
+  local self=${1:-acme-nginx} previous=${2-} root dir owner
+  [[ $self == acme-nginx ]] || return 1
+  root=$(store_root) || return 1
+  dir=$(store_domain_dir) || return 1
+  [[ -d $root && ! -L $root ]] || return 0
+  [[ -d $dir && ! -L $dir ]] || return 0
+  [[ -f $dir/meta.env && ! -L $dir/meta.env ]] || return 0
+  (
+    set -u
+    umask 077
+    exec 7> "$root/.lock" || exit 1
+    chmod 600 "$root/.lock" || exit 1
+    flock -w 30 7 || exit 1
+    [[ -f $dir/meta.env && ! -L $dir/meta.env ]] || exit 0
+    owner=$(sed -n 's/^owner=//p' "$dir/meta.env" 2>/dev/null | head -n 1)
+    [[ $owner == acme-nginx ]] || exit 0
+    case $previous in
+      ''|none) store_set_owner_locked "$dir" none ;;
+      *) store_set_owner_locked "$dir" "$previous" ;;
+    esac
+  )
+}
+
 # 显式接管：在 store 锁内把其他工具的 owner 交还为 none，让部署 hook 能把证书发布回本工具。
 store_force_owner_none(){
   local root dir owner
@@ -1826,6 +1915,31 @@ ensure_shared_cert_store_published(){
 }
 
 issue_certificate(){
+  local force=${1:-0} claim_status=0 claim_previous=''
+  [[ $force == 0 || $force == 1 ]] || return 1
+  store_claim_issuance acme-nginx || claim_status=$?
+  case $claim_status in
+    0) ;;
+    2)
+      red "共享证书库由其他工具负责续期，拒绝重复签发（如需接管请运行 acme-nginx force-renew）"
+      return 1
+      ;;
+    *)
+      red "共享证书库锁获取失败，无法在签发前确认续期负责人"
+      return 1
+      ;;
+  esac
+  claim_previous=${STORE_CLAIM_PREVIOUS:-}
+  if issue_certificate_core "$force"; then
+    return 0
+  fi
+  if ! store_release_claim acme-nginx "$claim_previous"; then
+    yellow "签发失败，且共享证书库 owner 回滚失败，请检查 $STORE_DIR"
+  fi
+  return 1
+}
+
+issue_certificate_core(){
   local -a issue_args
   local provider plugin current_identity force=${1:-0}
   [[ $force == 0 || $force == 1 ]] || return 1
@@ -2042,7 +2156,7 @@ acme_renew_state_path(){
 }
 
 acme_renew_runner_identity(){
-  printf '%s\n' "${ACME_RENEW_IDENTITY:-# acme-nginx-renew-v4}"
+  printf '%s\n' "${ACME_RENEW_IDENTITY:-# acme-nginx-renew-v5}"
 }
 
 # Parsed values are consumed by the certificate management module.
@@ -2197,6 +2311,10 @@ acme_renew_runner_is_current(){
     grep -Fqx -- '  store_lock_ok=0' "$runner" 2>/dev/null &&
     grep -Fqx -- '  if [[ $store_lock_ok -ne 1 ]]; then' "$runner" 2>/dev/null &&
     grep -Fq -- '共享证书库锁获取失败，跳过本次续期' "$runner" 2>/dev/null &&
+    grep -Fqx -- 'log_renewal_warning(){' "$runner" 2>/dev/null &&
+    grep -Fqx -- 'write_skipped_state(){' "$runner" 2>/dev/null &&
+    grep -Fq -- 'command -v logger' "$runner" 2>/dev/null &&
+    grep -Fqx -- '    write_skipped_state "$current_fingerprint"' "$runner" 2>/dev/null &&
     grep -Fqx -- 'runner_config_uses_store(){' "$runner" 2>/dev/null &&
     grep -Fqx -- '        store_owner=$(sed -n '\''s/^owner=//p'\'' "$store_meta" 2>/dev/null | head -n 1)' "$runner" 2>/dev/null &&
     grep -Fqx -- 'state_read_epoch=$(date +%s) || exit 1' "$runner" 2>/dev/null &&
@@ -2262,6 +2380,34 @@ read_runner_acme_identity(){
   printf '%s\n' "$identity"
 }
 
+# 有 logger 时同时写系统日志，便于排查锁失败/跳过原因。
+log_renewal_warning(){
+  echo "acme-nginx: $1" >&2
+  if command -v logger >/dev/null 2>&1; then
+    logger -t acme-nginx "$1" 2>/dev/null || true
+  fi
+}
+
+# 跳过本次续期时写 canonical skipped 状态（保持 last_renewal_epoch 不变）。
+write_skipped_state(){
+  local fingerprint=$1 check_epoch state_tmp
+  check_epoch=$(date +%s) || return 1
+  state_tmp=$(mktemp "$state_dir/.acme_renew.state.XXXXXX") || return 1
+  trap 'rm -f -- "$state_tmp"' EXIT
+  trap 'exit 1' HUP INT TERM
+  if ! printf '%s\n' \
+    "last_check_epoch=$check_epoch" \
+    "last_result=skipped" \
+    "last_exit_code=0" \
+    "last_renewal_epoch=$last_renewal_epoch" \
+    "cert_fingerprint=$fingerprint" > "$state_tmp" ||
+     ! chmod 600 "$state_tmp" ||
+     ! mv -fT -- "$state_tmp" "$state_file"; then
+    exit 1
+  fi
+  trap - EXIT HUP INT TERM
+}
+
 # 只有本机 CERT_SOURCE=store 时，才把续期让给共享库 owner。
 runner_config_uses_store(){
   local source
@@ -2319,7 +2465,9 @@ if [[ -d $store_root && ! -L $store_root ]]; then
   fi
   # 锁失败时无法确认 owner：跳过本次续期（fail-closed），避免与 owner 并发签发。
   if [[ $store_lock_ok -ne 1 ]]; then
-    echo "acme-nginx: 共享证书库锁获取失败，跳过本次续期（无法确认续期负责人）" >&2
+    log_renewal_warning "共享证书库锁获取失败，跳过本次续期（无法确认续期负责人）"
+    current_fingerprint=$(certificate_fingerprint || true)
+    write_skipped_state "$current_fingerprint"
     exit 0
   fi
 fi

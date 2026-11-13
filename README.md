@@ -132,7 +132,7 @@ bash tests/verify.sh
 
 ## 固定版本
 
-- 当前版本：0.6.5
+- 当前版本：0.7.0
 - acme.sh 固定为 `3.1.4`
 - 上游下载仅 HTTPS，并在执行前核对项目内固定的 SHA-256
 - 签发服务：Let's Encrypt（acme-v02）
@@ -151,7 +151,11 @@ bash tests/verify.sh
     owner=acme-nginx，最后安装续期 cron；`renew` 发现 owner 失效时走同一条接管路径。
   - 续期部署时 reload hook **先发布共享库再 reload nginx**，store 模式下 nginx 每次都能加载到新证书；
     发布与 owner 判定都在 store 锁内完成，runner 读取 owner 也短暂持锁（flock -w 5）。
-  - 已知限制：签发**前**的 owner double-check 尚未实现（只在发布/接管时持锁判定），并发接管窗口
-    仍需后续任务处理。
+  - reload hook 里的 `store_root` 按配置的 `STORE_DIR` 嵌入（必须是干净的绝对路径），
+    配置变更后 hook 自动判定过期并重写。
+  - **签发前 double-check（B6）**：发起 ACME 签发前先在 store 锁内 claim——若 owner 是其他
+    "存活"工具则拒绝签发；否则把 owner 置为本工具占位，签发失败/取消时回滚原 owner，
+    成功则保持 owner 并由发布流程写回。runner 在 store 锁获取失败时写 `skipped` 状态并跳过本次
+    （fail-closed），有 logger 时同时记录系统日志。
 - nginx 引用路径（store 模式）：`/etc/cert-store/<DOMAIN>/current/fullchain.pem` 与 `.../private.key`。
 - `uninstall` 不会删除 `/etc/cert-store`。

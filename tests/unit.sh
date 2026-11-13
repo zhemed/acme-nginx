@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC2016  # generated hook/runner text is matched literally
+# shellcheck disable=SC2016,SC2030,SC2031,SC2329  # literal generated text; subshell-owned vars/stubs
 set -Eeuo pipefail
 
 export LC_ALL=C
@@ -69,10 +69,10 @@ export ACME_GENERATIONS="$ACME_LIVE/generations"
 export ACME_CURRENT="$ACME_LIVE/current"
 export ACME_LOCK="$STATE_DIR/acme.lock"
 export ACME_CRON_MARKER="# acme-nginx-managed"
-export ACME_RELOAD_IDENTITY="# acme-nginx-reload-v3"
+export ACME_RELOAD_IDENTITY="# acme-nginx-reload-v4"
 export CERT_SOURCE=own
 export STORE_DIR=/etc/cert-store
-export ACME_RENEW_IDENTITY="# acme-nginx-renew-v4"
+export ACME_RENEW_IDENTITY="# acme-nginx-renew-v5"
 export ACME_VERSION="3.1.4"
 export ACME_ARCHIVE_SHA256="e5f8e187bbf5251e0cd8891f2622daab9850366bd17bea9f92c2fe2ee091fd32"
 export ACME_RENEW_RUNNER="$STATE_DIR/renew.sh"
@@ -431,6 +431,34 @@ pass "hook nginx reload integration"
 bash -n "$ACME_RELOAD" || fail "hook passes bash -n"
 pass "hook passes bash -n"
 
+# v0.7.0：reload hook 的 store_root 必须按配置嵌入，且配置变更后 hook 判定过期。
+reload_hook_embeds_configured_store_root(){
+  (
+    local custom="$TEMP_DIR/custom-store-root"
+    STORE_DIR="$custom"
+    write_acme_reload_hook || return 1
+    grep -Fqx "store_root=\"$custom\"" "$ACME_RELOAD" || return 1
+    acme_reload_hook_is_current || return 1
+    # 配置改回默认后旧 hook 必须判定过期，重写后恢复当前
+    STORE_DIR=/etc/cert-store
+    ! acme_reload_hook_is_current || return 1
+    write_acme_reload_hook || return 1
+    acme_reload_hook_is_current || return 1
+    # 非法共享库根（相对路径/空白/..）必须拒绝生成 hook
+    STORE_DIR='relative/path'
+    ! write_acme_reload_hook || return 1
+    STORE_DIR='/etc/cert store'
+    ! write_acme_reload_hook || return 1
+    STORE_DIR='/etc/cert-store/../escape'
+    ! write_acme_reload_hook || return 1
+    STORE_DIR=/etc/cert-store
+    write_acme_reload_hook
+  )
+}
+expect_success "reload hook embeds the configured shared store root" \
+  reload_hook_embeds_configured_store_root
+pass "custom store root is embedded, config changes invalidate the hook, invalid roots are rejected"
+
 # --- managed live layout uses acme-live (matches generated deploy script) ---
 case $(uname -s 2>/dev/null) in
   MINGW*|MSYS*)
@@ -513,18 +541,36 @@ pass "own-mode renewal is not skipped because another tool owns the shared store
 runner_fails_closed_when_store_lock_is_unavailable(){
   (
     local store="$TEMP_DIR/runner-lock-fail-store" marker="$TEMP_DIR/runner-lock-fail-called"
-    local output
+    local fakebin="$TEMP_DIR/fake-logger-bin" logger_log="$TEMP_DIR/fake-logger.log"
+    local output fingerprint
     printf '%s\n' 'example.com' > "$ACME_IDENTITY"
-    rm -rf "$store" "$marker"
-    mkdir -p "$store" && chmod 700 "$store" || return 1
+    printf '%s\n' 'cert-body-for-fingerprint' > "$ACME_CERT"
+    rm -rf "$store" "$marker" "$fakebin" "$logger_log"
+    mkdir -p "$store" "$fakebin" && chmod 700 "$store" "$fakebin" || return 1
     # 用目录占住锁文件位置，模拟锁获取失败（无法确认 owner 时必须跳过本次）。
     mkdir "$store/.lock" || return 1
+    printf '%s\n' '#!/bin/bash' "printf '%s\n' \"\$*\" >> '$logger_log'" 'exit 0' > "$fakebin/logger"
+    chmod 700 "$fakebin/logger"
     printf '%s\n' '#!/bin/bash' ": > '$marker'" 'exit 0' > "$ACME_BIN"
     chmod 700 "$ACME_BIN"
+    printf '%s\n' \
+      'last_check_epoch=1700000000' \
+      'last_result=unchanged' \
+      'last_exit_code=0' \
+      'last_renewal_epoch=0' \
+      "cert_fingerprint=$(printf 'a%.0s' {1..64})" > "$ACME_RENEW_STATE"
+    chmod 600 "$ACME_RENEW_STATE"
     STORE_DIR="$store" write_acme_renew_runner || return 1
-    output=$("$ACME_RENEW_RUNNER" 2>&1) || return 1
+    output=$(PATH="$fakebin:$PATH" "$ACME_RENEW_RUNNER" 2>&1) || return 1
     [[ ! -e $marker ]] || return 1
-    [[ $output == *'共享证书库锁获取失败'* ]]
+    [[ $output == *'共享证书库锁获取失败'* ]] || return 1
+    grep -Fq '共享证书库锁获取失败' "$logger_log" || return 1
+    load_acme_renew_state || return 1
+    fingerprint=$(sha256sum "$ACME_CERT" | awk '{print $1}')
+    [[ $ACME_RENEW_LAST_RESULT == skipped &&
+       $ACME_RENEW_LAST_EXIT_CODE -eq 0 &&
+       $ACME_RENEW_LAST_RENEWAL_EPOCH -eq 0 &&
+       $ACME_RENEW_FINGERPRINT == "$fingerprint" ]]
   )
 }
 expect_success "ACME runner fails closed when the shared store lock is unavailable" \
@@ -1118,6 +1164,25 @@ store_adoption_matrix_is_strict(){
     rm -f "$dir/generations/gen.ABC123/fullchain.pem"
     cp -p "$CERT_DIR/cert.pem" "$dir/generations/gen.ABC123/fullchain.pem"
     chmod 600 "$dir/generations/gen.ABC123/fullchain.pem"
+    # meta 含未知字段 / 缺 updated_by
+    printf '%s\n' 'unknown=1' >> "$dir/meta.env"
+    ! store_certificate_is_adoptable || return 1
+    restore_meta || return 1
+    grep -v '^updated_by=' "$meta_bak" > "$dir/meta.env"
+    chmod 600 "$dir/meta.env"
+    ! store_certificate_is_adoptable || return 1
+    restore_meta || return 1
+    # generation 目录权限 755
+    chmod 755 "$dir/generations/gen.ABC123"
+    ! store_certificate_is_adoptable || return 1
+    chmod 700 "$dir/generations/gen.ABC123"
+    # private.key 为符号链接
+    rm -f "$dir/generations/gen.ABC123/private.key"
+    ln -s "$CERT_DIR/key.pem" "$dir/generations/gen.ABC123/private.key"
+    ! store_certificate_is_adoptable || return 1
+    rm -f "$dir/generations/gen.ABC123/private.key"
+    cp -p "$CERT_DIR/key.pem" "$dir/generations/gen.ABC123/private.key"
+    chmod 600 "$dir/generations/gen.ABC123/private.key"
     # 恢复后仍可领养
     store_certificate_is_adoptable
   )
@@ -1125,3 +1190,84 @@ store_adoption_matrix_is_strict(){
 expect_success "store adoption enforces the full metadata/permission/layout contract" \
   store_adoption_matrix_is_strict
 pass "missing or malformed meta, wrong permissions and invalid current are all refused"
+
+# --- v0.7.0：B6 签发前 claim（owner double-check + 失败回滚）---
+write_claim_meta(){
+  local dir=$1 owner=$2 now fp
+  now=$(date +%s)
+  fp=$(printf 'b%.0s' {1..64})
+  printf 'version=1\ndomain=example.com\nalt=\nowner=%s\nissuer=letsencrypt\nissued_at=%s\nnot_after=%s\nfingerprint=%s\nupdated_at=%s\nupdated_by=%s\n' \
+    "$owner" "$now" "$now" "$fp" "$now" "$owner" > "$dir/meta.env"
+  chmod 600 "$dir/meta.env"
+}
+
+store_claim_issuance_checks_live_owner_and_rolls_back(){
+  (
+    local store="$TEMP_DIR/store-claim"
+    local dir="$store/example.com"
+    CERT_SOURCE=store
+    STORE_DIR="$store"
+    ACME_PRIMARY_DOMAIN=example.com
+    mkdir -p "$dir" || return 1
+    chmod 700 "$store" "$dir" || return 1
+    # 存活的对方 owner：拒绝，且不改 meta
+    write_claim_meta "$dir" sb
+    store_owner_present(){ [[ ${1-} == sb ]]; }
+    ! store_claim_issuance acme-nginx || return 1
+    [[ $(sed -n 's/^owner=//p' "$dir/meta.env" | head -n 1) == sb ]] || return 1
+    # 失联的对方 owner：占位成功并记录 previous，失败回滚恢复
+    store_owner_present(){ return 1; }
+    write_claim_meta "$dir" sb
+    store_claim_issuance acme-nginx || return 1
+    [[ $(sed -n 's/^owner=//p' "$dir/meta.env" | head -n 1) == acme-nginx ]] || return 1
+    [[ $STORE_CLAIM_PREVIOUS == sb ]] || return 1
+    store_release_claim acme-nginx "$STORE_CLAIM_PREVIOUS" || return 1
+    [[ $(sed -n 's/^owner=//p' "$dir/meta.env" | head -n 1) == sb ]] || return 1
+    # owner=none：占位成功，previous=none，回滚回 none
+    write_claim_meta "$dir" none
+    store_claim_issuance acme-nginx || return 1
+    [[ $STORE_CLAIM_PREVIOUS == none ]] || return 1
+    store_release_claim acme-nginx none || return 1
+    [[ $(sed -n 's/^owner=//p' "$dir/meta.env" | head -n 1) == none ]] || return 1
+    # meta 缺失：claim 为 no-op 成功
+    rm -f "$dir/meta.env"
+    store_claim_issuance acme-nginx || return 1
+    [[ -z $STORE_CLAIM_PREVIOUS ]]
+  )
+}
+expect_success "store claim rejects a live other owner and rolls back on failure" \
+  store_claim_issuance_checks_live_owner_and_rolls_back
+pass "claim placeholder and rollback keep the store owner consistent"
+
+issue_certificate_claims_before_issuing(){
+  (
+    local store="$TEMP_DIR/issue-claim-store"
+    local dir="$store/example.com"
+    local marker="$TEMP_DIR/issue-claim-called"
+    CERT_SOURCE=store
+    STORE_DIR="$store"
+    ACME_PRIMARY_DOMAIN=example.com
+    red(){ :; }
+    yellow(){ :; }
+    green(){ :; }
+    mkdir -p "$dir" || return 1
+    chmod 700 "$store" "$dir" || return 1
+    rm -f "$marker"
+    # 存活的其他工具 owner：必须在调用签发 core 之前拒绝
+    write_claim_meta "$dir" sb
+    store_owner_present(){ [[ ${1-} == sb ]]; }
+    issue_certificate_core(){ : > "$marker"; return 0; }
+    ! issue_certificate || return 1
+    [[ ! -e $marker ]] || return 1
+    [[ $(sed -n 's/^owner=//p' "$dir/meta.env" | head -n 1) == sb ]] || return 1
+    # 失联的其他工具 owner：签发失败时回滚 owner
+    store_owner_present(){ return 1; }
+    write_claim_meta "$dir" sb
+    issue_certificate_core(){ return 1; }
+    ! issue_certificate || return 1
+    [[ $(sed -n 's/^owner=//p' "$dir/meta.env" | head -n 1) == sb ]]
+  )
+}
+expect_success "issue certificate claims before issuing and releases on failure" \
+  issue_certificate_claims_before_issuing
+pass "live other owner blocks issuance and failed issuance restores the previous owner"

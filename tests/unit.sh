@@ -69,6 +69,8 @@ export ACME_CURRENT="$ACME_LIVE/current"
 export ACME_LOCK="$STATE_DIR/acme.lock"
 export ACME_CRON_MARKER="# acme-nginx-managed"
 export ACME_RELOAD_IDENTITY="# acme-nginx-reload-v2"
+export CERT_SOURCE=own
+export STORE_DIR=/etc/cert-store
 export ACME_RENEW_IDENTITY="# acme-nginx-renew-v1"
 export ACME_VERSION="3.1.4"
 export ACME_ARCHIVE_SHA256="e5f8e187bbf5251e0cd8891f2622daab9850366bd17bea9f92c2fe2ee091fd32"
@@ -782,3 +784,45 @@ if compgen -G "$guard_repo/root/nginx-etc-backup-*.tar.gz" >/dev/null; then
   fail "guarded abort must not create a backup"
 fi
 pass "install self-check guard"
+
+# --- shared certificate store (v0.4.0) ---
+write_config_fixture cloudflare 0
+expect_success "config defaults to own certificate source" load_config
+[[ $CERT_SOURCE == own && $STORE_DIR == /etc/cert-store ]] || fail "store defaults"
+pass "config defaults to own source and /etc/cert-store"
+CERT_SOURCE=store
+STORE_DIR="$TEMP_DIR/store-config-check"
+[[ $(store_root) == "$STORE_DIR" ]] || fail "store root value"
+pass "store root honours STORE_DIR"
+CERT_SOURCE=own
+STORE_DIR=/etc/cert-store
+
+store_dir="$TEMP_DIR/shared-cert-store"
+rm -rf "$store_dir"
+mkdir -p "$store_dir/example.com/generations/gen.TEST1"
+chmod 700 "$store_dir" "$store_dir/example.com" \
+  "$store_dir/example.com/generations" "$store_dir/example.com/generations/gen.TEST1"
+cp -p "$CERT_DIR/cert.pem" "$store_dir/example.com/generations/gen.TEST1/fullchain.pem"
+cp -p "$CERT_DIR/key.pem" "$store_dir/example.com/generations/gen.TEST1/private.key"
+chmod 600 "$store_dir/example.com/generations/gen.TEST1/fullchain.pem" \
+  "$store_dir/example.com/generations/gen.TEST1/private.key"
+ln -s generations/gen.TEST1 "$store_dir/example.com/current"
+store_fingerprint=$(sha256sum "$CERT_DIR/cert.pem" | awk '{print $1}')
+store_now=$(date +%s)
+printf 'version=1\ndomain=example.com\nalt=\nowner=acme-nginx\nissuer=letsencrypt\nissued_at=%s\nnot_after=%s\nfingerprint=%s\nupdated_at=%s\nupdated_by=acme-nginx\n' \
+  "$store_now" "$store_now" "$store_fingerprint" "$store_now" > "$store_dir/example.com/meta.env"
+chmod 600 "$store_dir/example.com/meta.env"
+CERT_SOURCE=store
+STORE_DIR="$store_dir"
+ACME_PRIMARY_DOMAIN=example.com
+ACME_WILDCARD_DOMAIN=
+expect_success "store mode is enabled" store_mode
+[[ $(store_owner) == acme-nginx ]] || fail "store owner value"
+pass "store owner is readable"
+expect_success "store certificate is adoptable" store_certificate_is_adoptable
+[[ $STORE_CERT == "$store_dir/example.com/current/fullchain.pem" &&
+   $STORE_KEY == "$store_dir/example.com/current/private.key" ]] ||
+  fail "adopted store certificate paths"
+pass "store certificate adoption exposes stable paths"
+CERT_SOURCE=own
+expect_failure "store adoption requires store mode" store_certificate_is_adoptable

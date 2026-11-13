@@ -34,12 +34,12 @@ grep -Fq -- 'https://codeload.github.com/acmesh-official/acme.sh/tar.gz/refs/tag
 if grep -Fq -- '--install-online' "$ROOT_DIR/acme-nginx.sh"; then
   fail "unverified acme.sh online installer remains"
 fi
-[[ $(grep -Fxc 'acme_nginx_version="v0.6.3"' "$ROOT_DIR/acme-nginx.sh" || true) -eq 1 ]] ||
-  fail "script version is not 0.6.3"
-[[ $(tr -d '\r\n' < "$ROOT_DIR/VERSION") == '0.6.3' ]] ||
-  fail "VERSION file is not 0.6.3"
-grep -Fq -- "当前版本：0.6.3" "$ROOT_DIR/README.md" ||
-  fail "README project version is not 0.6.3"
+[[ $(grep -Fxc 'acme_nginx_version="v0.6.4"' "$ROOT_DIR/acme-nginx.sh" || true) -eq 1 ]] ||
+  fail "script version is not 0.6.4"
+[[ $(tr -d '\r\n' < "$ROOT_DIR/VERSION") == '0.6.4' ]] ||
+  fail "VERSION file is not 0.6.4"
+grep -Fq -- "当前版本：0.6.4" "$ROOT_DIR/README.md" ||
+  fail "README project version is not 0.6.4"
 
 for store_pattern in \
   'CERT_SOURCE=store' \
@@ -68,6 +68,23 @@ for owner_pattern in 'store_release_ownership(){' 'store_owner_present(){'; do
   grep -Fq -- "$owner_pattern" "$ROOT_DIR/acme-nginx.sh" ||
     fail "dynamic ownership support is missing: $owner_pattern"
 done
+# v0.6.4：自动钩子按标记升级、store 锁内显式接管、owner 写回校验。
+for takeover_pattern in \
+  'post_reload_hook_is_managed(){' \
+  'store_set_owner_locked(){' \
+  'store_force_owner_none(){' \
+  'reload_nginx_service(){' \
+  'with_acme_lock issue_certificate 1' \
+  '无法在共享证书库锁内交还续期责任' \
+  'owner 未写回 acme-nginx' \
+  'nginx 已 reload 并加载共享库中的新证书'; do
+  grep -Fq -- "$takeover_pattern" "$ROOT_DIR/acme-nginx.sh" ||
+    fail "v0.6.4 store takeover support is missing: $takeover_pattern"
+done
+# 钩子升级判定不能再用 -F 与 -E 冲突的 grep 组合（GNU 报错、BusyBox 永不匹配）。
+if grep -Fq -- 'grep -FqE' "$ROOT_DIR/acme-nginx.sh"; then
+  fail "hook upgrade detection uses the invalid grep -FqE combination"
+fi
 
 # shellcheck disable=SC2016
 for pattern in \

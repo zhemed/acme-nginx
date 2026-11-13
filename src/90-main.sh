@@ -54,7 +54,8 @@ cmd_issue(){
       return 0
     fi
     store_owner_value=$(store_owner 2>/dev/null || true)
-    if [[ -n $store_owner_value && $store_owner_value != acme-nginx ]]; then
+    if [[ -n $store_owner_value && $store_owner_value != none &&
+          $store_owner_value != acme-nginx ]]; then
       red "共享证书库中该域名的证书不可用，且续期负责人是 $store_owner_value"
       yellow "请先让 $store_owner_value 续期/修复，或在本机运行 acme-nginx force-renew 显式取得签发权"
       return 1
@@ -108,11 +109,24 @@ cmd_renew(){
       return 0
     else
       yellow "共享证书库无有效续期负责人（owner: ${store_owner_value:-none}），尝试重新签发接管"
+      if ! store_force_owner_none; then
+        red "无法在共享证书库锁内交还续期责任，请检查 $STORE_DIR"
+        return 1
+      fi
       if ! with_acme_lock issue_certificate; then
         red "接管续期失败，请检查凭据后重试"
         return 1
       fi
+      ensure_shared_cert_store_published || true
+      store_owner_value=$(store_owner 2>/dev/null || true)
+      if [[ $store_owner_value != acme-nginx ]]; then
+        red "接管签发完成，但共享证书库 owner 未写回 acme-nginx（owner: ${store_owner_value:-未知}），自动续期未安装"
+        return 1
+      fi
       with_acme_lock setup_acme_renew_cron || true
+      if nginx_running && ! reload_nginx_service; then
+        yellow "证书已接管，但 nginx reload 失败，请手动检查"
+      fi
       return 0
     fi
   fi
@@ -141,6 +155,18 @@ nginx_running(){
   fi
 }
 
+# 部署 hook 先 reload nginx、之后才发布共享库，所以接管路径要在发布后再 reload 一次，
+# 确保 nginx 读到的是刚写进 /etc/cert-store 的新证书。
+reload_nginx_service(){
+  if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+    systemctl reload nginx >/dev/null 2>&1
+  elif command -v rc-service >/dev/null 2>&1; then
+    rc-service nginx reload >/dev/null 2>&1
+  else
+    return 1
+  fi
+}
+
 cmd_force_renew(){
   if ! core_dependencies_ready; then
     red "缺少必要命令，请先安装依赖"
@@ -151,6 +177,41 @@ cmd_force_renew(){
     return 1
   fi
   prepare_state_dir || { red "初始化状态目录失败：$STATE_DIR"; return 1; }
+  if store_mode; then
+    # store 模式下非 owner 的续期会被 runner 跳过（cron 也可能已被移除），
+    # 因此 force-renew 走显式接管：先在 store 锁内把其他工具的 owner 交还为 none，
+    # 再强制签发，让部署 hook 把证书发布回来并写 owner=acme-nginx，最后装 cron。
+    yellow "强制重签会立即联系 Let's Encrypt，并计入证书签发频率限制"
+    if ! store_force_owner_none; then
+      red "无法在共享证书库锁内交还续期责任，请检查 $STORE_DIR"
+      return 1
+    fi
+    green "正在强制重新签发当前证书……"
+    if ! with_acme_lock issue_certificate 1; then
+      red "强制重签失败，请查看上方 acme.sh 输出"
+      return 1
+    fi
+    ensure_sb_restart_post_hook || true
+    ensure_shared_cert_store_published || true
+    store_owner_value=$(store_owner 2>/dev/null || true)
+    if [[ $store_owner_value != acme-nginx ]]; then
+      red "签发完成，但共享证书库 owner 未写回 acme-nginx（owner: ${store_owner_value:-未知}），自动续期未安装"
+      return 1
+    fi
+    if ! with_acme_lock setup_acme_renew_cron; then
+      yellow "证书已签发，但自动续期任务设置失败，请检查 root crontab 与 cron 服务"
+    fi
+    if nginx_running; then
+      if reload_nginx_service; then
+        green "证书已重新签发，nginx 已 reload 并加载共享库中的新证书"
+      else
+        yellow "证书已重新签发，但 nginx reload 失败，请手动检查"
+      fi
+    else
+      yellow "证书已重新签发；nginx 当前未运行，下次启动时会加载新证书"
+    fi
+    return 0
+  fi
   if load_certificate_metadata "$ACME_CERT" "$ACME_KEY" 2>/dev/null &&
      [[ $CERT_META_STATE == valid ]] &&
      ! certificate_covers_configured_domains "$ACME_CERT"; then
@@ -331,7 +392,8 @@ cmd_status(){
 }
 
 cmd_uninstall(){
-  store_release_ownership acme-nginx >/dev/null 2>&1 || true
+  # 锁顺序固定：先 ACME 锁，再在 store_release_ownership 内短暂持有 store 锁。
+  with_acme_lock store_release_ownership acme-nginx >/dev/null 2>&1 || true
   if ! with_acme_lock remove_acme_renew_cron; then
     red "移除续期定时任务失败"
     return 1

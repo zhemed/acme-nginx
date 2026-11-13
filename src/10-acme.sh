@@ -1163,6 +1163,13 @@ adopt_store_certificate(){
   return 0
 }
 
+# 自动创建的 post_reload 钩子只认已知标记：命中才允许按内容升级，否则一律视为用户自定义钩子。
+post_reload_hook_is_managed(){
+  local hook=$1
+  grep -Fq -e 'shared-cert-store peer hook' \
+    -e 'acme-nginx-managed sb restart hook' "$hook" 2>/dev/null
+}
+
 # 检测到本机 sb 服务时，自动创建证书部署后的重启钩子（不覆盖自定义钩子；自动创建的钩子会随内容升级重写）。
 ensure_sb_restart_post_hook(){
   local hook="$STATE_DIR/post_reload.sh" tmp
@@ -1192,7 +1199,7 @@ HOOK
       rm -f "$tmp"
       return 0
     fi
-    if grep -FqE 'shared-cert-store peer hook|acme-nginx-managed sb restart hook' "$hook" 2>/dev/null; then
+    if post_reload_hook_is_managed "$hook"; then
       if cmp -s -- "$tmp" "$hook"; then
         rm -f "$tmp"
         return 0
@@ -1217,26 +1224,65 @@ store_owner_present(){
   esac
 }
 
+# 调用方必须已持有 store 锁；只改写已有 meta 的 owner/updated_* 三行。
+store_set_owner_locked(){
+  local dir=$1 owner=$2 meta_tmp now
+  [[ -f $dir/meta.env && ! -L $dir/meta.env ]] || return 1
+  now=$(date +%s) || return 1
+  meta_tmp=$(mktemp "$dir/.meta.XXXXXX") || return 1
+  if sed -e "s/^owner=.*/owner=$owner/" \
+       -e 's/^updated_by=.*/updated_by=acme-nginx/' \
+       -e "s/^updated_at=.*/updated_at=$now/" "$dir/meta.env" > "$meta_tmp" &&
+     chmod 600 "$meta_tmp" && mv -fT -- "$meta_tmp" "$dir/meta.env"; then
+    return 0
+  fi
+  rm -f -- "$meta_tmp"
+  return 1
+}
+
+# 交还续期权（owner=acme-nginx → none）。整段在 store 锁内完成；调用方需保证
+# 锁顺序固定为 ACME 锁 → store 锁，且 store 锁只在这里短暂持有。
 store_release_ownership(){
-  local owner=$1 root dir meta_tmp now
+  local owner=$1 root dir
   [[ ${owner-} == acme-nginx ]] || return 1
   root=$(store_root) || return 1
   [[ -d $root && ! -L $root ]] || return 0
-  for dir in "$root"/*/; do
-    [[ -d $dir && ! -L $dir ]] || continue
-    dir=${dir%/}
-    [[ -f $dir/meta.env && ! -L $dir/meta.env ]] || continue
-    [[ $(sed -n 's/^owner=//p' "$dir/meta.env" | head -n 1) == acme-nginx ]] || continue
-    now=$(date +%s) || continue
-    meta_tmp=$(mktemp "$dir/.meta.XXXXXX") || continue
-    if sed -e "s/^owner=.*/owner=none/" -e "s/^updated_by=.*/updated_by=acme-nginx/" \
-         -e "s/^updated_at=.*/updated_at=$now/" "$dir/meta.env" > "$meta_tmp" &&
-       chmod 600 "$meta_tmp" && mv -fT -- "$meta_tmp" "$dir/meta.env"; then
-      :
-    else
-      rm -f "$meta_tmp"
-    fi
-  done
+  (
+    set -u
+    umask 077
+    exec 7> "$root/.lock" || exit 1
+    chmod 600 "$root/.lock" || exit 1
+    flock -w 30 7 || exit 1
+    for dir in "$root"/*/; do
+      [[ -d $dir && ! -L $dir ]] || continue
+      dir=${dir%/}
+      [[ -f $dir/meta.env && ! -L $dir/meta.env ]] || continue
+      [[ $(sed -n 's/^owner=//p' "$dir/meta.env" | head -n 1) == acme-nginx ]] || continue
+      store_set_owner_locked "$dir" none || continue
+    done
+    exit 0
+  )
+}
+
+# 显式接管：在 store 锁内把其他工具的 owner 交还为 none，让部署 hook 能把证书发布回本工具。
+store_force_owner_none(){
+  local root dir owner
+  root=$(store_root) || return 1
+  [[ -d $root && ! -L $root ]] || return 0
+  dir=$(store_domain_dir) || return 1
+  (
+    set -u
+    umask 077
+    exec 7> "$root/.lock" || exit 1
+    chmod 600 "$root/.lock" || exit 1
+    flock -w 30 7 || exit 1
+    [[ -f $dir/meta.env && ! -L $dir/meta.env ]] || exit 0
+    owner=$(sed -n 's/^owner=//p' "$dir/meta.env" 2>/dev/null | head -n 1)
+    case $owner in
+      ''|none|acme-nginx) exit 0 ;;
+    esac
+    store_set_owner_locked "$dir" none
+  )
 }
 
 publish_own_certificate_to_store(){
@@ -1349,7 +1395,8 @@ ensure_shared_cert_store_published(){
 
 issue_certificate(){
   local -a issue_args
-  local provider plugin current_identity
+  local provider plugin current_identity force=${1:-0}
+  [[ $force == 0 || $force == 1 ]] || return 1
   provider=${DNS_PROVIDER:-cloudflare}
   [[ -n ${ACME_PRIMARY_DOMAIN:-} ]] || return 1
   valid_dns_provider "$provider" || return 1
@@ -1386,6 +1433,10 @@ issue_certificate(){
       issue_args+=(--force)
       yellow "检测到已有证书但签发机构与当前配置不一致，将强制重新签发"
     fi
+  fi
+  # 显式接管/强制重签：即使本机已有有效证书也要求 acme.sh 立即重签。
+  if ((force == 1)); then
+    issue_args+=(--force)
   fi
   if [[ -n ${ACME_WILDCARD_DOMAIN:-} ]]; then
     issue_args+=(-d "$ACME_WILDCARD_DOMAIN")

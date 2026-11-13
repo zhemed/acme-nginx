@@ -876,3 +876,106 @@ expect_success "store certificate is adoptable" store_certificate_is_adoptable
 pass "store certificate adoption exposes stable paths"
 CERT_SOURCE=own
 expect_failure "store adoption requires store mode" store_certificate_is_adoptable
+
+# --- v0.6.4：自动钩子按标记升级（P1-1），store 锁与显式接管原语 ---
+post_reload_hook_is_managed_matches_known_markers(){
+  local dir="$TEMP_DIR/post-reload-markers"
+  mkdir -p "$dir" || return 1
+  printf '%s\n' '#!/bin/bash' '# shared-cert-store peer hook v1' > "$dir/v1"
+  printf '%s\n' '#!/bin/bash' '# acme-nginx-managed sb restart hook' > "$dir/legacy"
+  printf '%s\n' '#!/bin/bash' '# my custom hook' > "$dir/custom"
+  post_reload_hook_is_managed "$dir/v1" &&
+    post_reload_hook_is_managed "$dir/legacy" &&
+    ! post_reload_hook_is_managed "$dir/custom" &&
+    ! post_reload_hook_is_managed "$dir/missing"
+}
+expect_success "managed peer hook markers are recognized" \
+  post_reload_hook_is_managed_matches_known_markers
+pass "custom peer hooks are never treated as managed"
+
+post_reload_hook_upgrade_is_marker_scoped(){
+  (
+    local hook="$STATE_DIR/post_reload.sh" first_hash
+    # shellcheck disable=SC2317,SC2329  # stubs are invoked indirectly by ensure_sb_restart_post_hook
+    systemctl(){ return 0; }
+    # shellcheck disable=SC2317,SC2329
+    yellow(){ :; }
+    # shellcheck disable=SC2317,SC2329
+    red(){ :; }
+    # shellcheck disable=SC2317,SC2329
+    green(){ :; }
+    rm -f "$hook"
+    printf '%s\n' '#!/bin/bash' '# acme-nginx-managed sb restart hook' \
+      'systemctl restart sb' > "$hook"
+    chmod 700 "$hook"
+    ensure_sb_restart_post_hook || return 1
+    grep -Fq '# shared-cert-store peer hook v2' "$hook" || return 1
+    post_reload_hook_is_managed "$hook" || return 1
+    first_hash=$(sha256sum "$hook" | awk '{print $1}')
+    ensure_sb_restart_post_hook || return 1
+    [[ $(sha256sum "$hook" | awk '{print $1}') == "$first_hash" ]] || return 1
+    printf '%s\n' '#!/bin/bash' '# my custom hook' 'echo custom' > "$hook"
+    chmod 700 "$hook"
+    ensure_sb_restart_post_hook || return 1
+    grep -Fqx '# my custom hook' "$hook"
+  )
+}
+if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+  expect_success "auto-created sb restart hook upgrades only managed markers" \
+    post_reload_hook_upgrade_is_marker_scoped
+  pass "old auto-created hook is upgraded, current hook is idempotent, custom hook is kept"
+else
+  pass "auto-created sb restart hook upgrade is covered on systemd CI"
+fi
+
+write_owner_meta_fixture(){
+  local dir=$1 owner=$2 now
+  now=$(date +%s) || return 1
+  printf '%s\n' \
+    'version=1' "domain=${dir##*/}" 'alt=' "owner=$owner" 'issuer=letsencrypt' \
+    "issued_at=$now" "not_after=$now" \
+    "fingerprint=$(printf 'a%.0s' {1..64})" "updated_at=$now" "updated_by=$owner" \
+    > "$dir/meta.env" || return 1
+  chmod 600 "$dir/meta.env"
+}
+
+store_force_owner_none_takes_over_other_owner(){
+  (
+    local store="$TEMP_DIR/store-force-owner"
+    rm -rf "$store"
+    mkdir -p "$store/example.com" || return 1
+    chmod 700 "$store" "$store/example.com" || return 1
+    write_owner_meta_fixture "$store/example.com" sb || return 1
+    STORE_DIR="$store" ACME_PRIMARY_DOMAIN=example.com store_force_owner_none || return 1
+    [[ $(sed -n 's/^owner=//p' "$store/example.com/meta.env" | head -n 1) == none ]] || return 1
+    grep -Fqx 'updated_by=acme-nginx' "$store/example.com/meta.env" || return 1
+    STORE_DIR="$store" ACME_PRIMARY_DOMAIN=example.com store_force_owner_none || return 1
+    [[ $(sed -n 's/^owner=//p' "$store/example.com/meta.env" | head -n 1) == none ]] || return 1
+    # 没有 meta 时不报错，直接返回 0
+    rm -rf "$store/example.com"
+    STORE_DIR="$store" ACME_PRIMARY_DOMAIN=example.com store_force_owner_none
+  )
+}
+expect_success "store takeover only clears another tool's owner under the store lock" \
+  store_force_owner_none_takes_over_other_owner
+pass "owner=none is idempotent and a missing meta is tolerated"
+
+store_release_ownership_uses_store_lock(){
+  (
+    local store="$TEMP_DIR/store-release-lock"
+    rm -rf "$store"
+    mkdir -p "$store/example.com" || return 1
+    chmod 700 "$store" "$store/example.com" || return 1
+    write_owner_meta_fixture "$store/example.com" acme-nginx || return 1
+    STORE_DIR="$store" store_release_ownership acme-nginx || return 1
+    [[ $(sed -n 's/^owner=//p' "$store/example.com/meta.env" | head -n 1) == none ]] || return 1
+    [[ -f $store/.lock && ! -L $store/.lock ]] || return 1
+    [[ $(stat -c '%a' "$store/.lock") == 600 ]] || return 1
+    # 交还后再次调用不改变 owner，也不报错
+    STORE_DIR="$store" store_release_ownership acme-nginx || return 1
+    [[ $(sed -n 's/^owner=//p' "$store/example.com/meta.env" | head -n 1) == none ]]
+  )
+}
+expect_success "store ownership release runs under the shared store lock" \
+  store_release_ownership_uses_store_lock
+pass "store lock file is private and release is idempotent"

@@ -44,6 +44,18 @@ cmd_issue(){
     return 1
   fi
   prepare_state_dir || { red "初始化状态目录失败：$STATE_DIR"; return 1; }
+  if store_mode; then
+    if store_certificate_is_adoptable; then
+      adopt_store_certificate || return 1
+      return 0
+    fi
+    store_owner_value=$(store_owner 2>/dev/null || true)
+    if [[ -n $store_owner_value && $store_owner_value != acme-nginx ]]; then
+      red "共享证书库中该域名的证书不可用，且续期负责人是 $store_owner_value"
+      yellow "请先让 $store_owner_value 续期/修复，或在本机运行 acme-nginx force-renew 显式取得签发权"
+      return 1
+    fi
+  fi
   if identity=$(read_acme_identity 2>/dev/null) &&
      load_certificate_metadata "$ACME_CERT" "$ACME_KEY" 2>/dev/null &&
      [[ $CERT_META_STATE == valid ]] &&
@@ -239,6 +251,16 @@ cmd_status(){
   if ! config_is_present || ! load_config 2>/dev/null; then
     config_ok=0
     yellow "配置文件缺失或无效：$CONFIG_FILE（自动续期状态可能不准确）"
+  fi
+  if store_mode; then
+    if store_certificate_is_adoptable; then
+      show_certificate_metadata "共享证书库（/etc/cert-store）" "$STORE_CERT" "$STORE_KEY" "$ACME_PRIMARY_DOMAIN"
+      printf '共享证书库: %s（owner: %s）\n' "$(store_domain_dir)" "$(store_owner 2>/dev/null || echo 未知)"
+      printf 'Nginx 引用路径: %s / %s\n' "$STORE_CERT" "$STORE_KEY"
+    else
+      red "共享证书库中暂无可领养的证书：$(store_domain_dir 2>/dev/null || echo 未知)"
+    fi
+    return 0
   fi
   if ! identity=$(read_acme_identity 2>/dev/null); then
     red "尚未找到 ACME 身份，证书可能未签发"

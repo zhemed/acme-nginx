@@ -581,7 +581,7 @@ write_acme_reload_hook(){
 #!/bin/bash
 # Signal handlers and EXIT cleanup functions are invoked indirectly by Bash.
 # shellcheck disable=SC2317,SC2329
-# acme-nginx-reload-v1
+# acme-nginx-reload-v2
 export LANG=en_US.UTF-8
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 base="/etc/acme-nginx"
@@ -595,6 +595,8 @@ old_current_target=
 deployment_started=0
 created_layout=0
 restore_managed_links=0
+store_root="/etc/cert-store"
+post_reload="/etc/acme-nginx/post_reload.sh"
 
 cleanup_deploy_files(){
   [[ -z $stage_cert ]] || rm -f -- "$stage_cert"
@@ -698,6 +700,130 @@ reload_nginx(){
   else
     return 1
   fi
+}
+
+warn_post_reload(){
+  echo "acme-nginx: $1" >&2
+  if command -v logger >/dev/null 2>&1; then
+    logger -t acme-nginx "post-reload: $1" 2>/dev/null || true
+  fi
+}
+
+run_post_reload_hook(){
+  local owner mode
+  [[ -e $post_reload || -L $post_reload ]] || return 0
+  if [[ ! -f $post_reload || -L $post_reload || ! -x $post_reload ]]; then
+    warn_post_reload "ignoring untrusted post-reload hook: $post_reload"
+    return 0
+  fi
+  owner=$(stat -c '%u' "$post_reload" 2>/dev/null) || return 0
+  mode=$(stat -c '%a' "$post_reload" 2>/dev/null) || return 0
+  if [[ $owner != "$(id -u)" ]] || (( (8#$mode & 0022) != 0 )); then
+    warn_post_reload "ignoring untrusted post-reload hook: $post_reload"
+    return 0
+  fi
+  if ! "$post_reload"; then
+    warn_post_reload "post-reload hook failed: $post_reload"
+  fi
+  return 0
+}
+
+# 证书成功切换后发布到共享证书库（owner 不是 acme-nginx 时跳过）。
+store_publish(){
+  local identity=$1 store_dir generations gen current meta_tmp fingerprint not_after owner
+  local now alt old_current generation current_target enddate not_after_epoch
+  [[ -d $store_root && ! -L $store_root ]] || return 0
+  [[ $identity =~ ^[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9]$ ]] || return 0
+  store_dir="$store_root/$identity"
+  if [[ -f $store_dir/meta.env && ! -L $store_dir/meta.env ]]; then
+    owner=$(sed -n 's/^owner=//p' "$store_dir/meta.env" 2>/dev/null | head -n 1)
+    case $owner in
+      acme-nginx|none|'') ;;
+      *) return 0 ;;
+    esac
+  fi
+  (
+    set -u
+    umask 077
+    exec 7> "$store_root/.lock" || exit 1
+    chmod 600 "$store_root/.lock" || exit 1
+    flock -w 30 7 || exit 1
+    if [[ -e $store_dir || -L $store_dir ]]; then
+      [[ -d $store_dir && ! -L $store_dir ]] || exit 1
+    else
+      mkdir "$store_dir" || exit 1
+      chmod 700 "$store_dir" || exit 1
+    fi
+    generations="$store_dir/generations"
+    if [[ -e $generations || -L $generations ]]; then
+      [[ -d $generations && ! -L $generations ]] || exit 1
+    else
+      mkdir "$generations" || exit 1
+      chmod 700 "$generations" || exit 1
+    fi
+    gen=$(mktemp -d "$generations/gen.XXXXXX") || exit 1
+    chmod 700 "$gen" || exit 1
+    cp -- "$cert" "$gen/fullchain.pem" || exit 1
+    cp -- "$key" "$gen/private.key" || exit 1
+    chmod 600 "$gen/fullchain.pem" "$gen/private.key" || exit 1
+    openssl x509 -in "$gen/fullchain.pem" -noout >/dev/null 2>&1 || exit 1
+    openssl pkey -in "$gen/private.key" -pubout >/dev/null 2>&1 || exit 1
+    fingerprint=$(sha256sum "$gen/fullchain.pem" | awk '{print $1}') || exit 1
+    [[ $fingerprint =~ ^[0-9a-f]{64}$ ]] || exit 1
+    not_after=0
+    if enddate=$(openssl x509 -in "$gen/fullchain.pem" -noout -enddate 2>/dev/null); then
+      not_after_epoch=$(date -d "${enddate#notAfter=}" +%s 2>/dev/null) && not_after=$not_after_epoch
+    fi
+    alt=
+    if openssl x509 -in "$gen/fullchain.pem" -noout -text 2>/dev/null |
+         grep -qE "DNS:\*\.$identity([,[:space:]]|$)"; then
+      alt="*.$identity"
+    fi
+    old_current=$(readlink "$store_dir/current" 2>/dev/null || true)
+    current=$(mktemp "$store_dir/.current.XXXXXX") || exit 1
+    rm -f -- "$current" || exit 1
+    ln -s -- "generations/${gen##*/}" "$current" || exit 1
+    mv -Tf -- "$current" "$store_dir/current" || exit 1
+    now=$(date +%s) || exit 1
+    meta_tmp=$(mktemp "$store_dir/.meta.XXXXXX") || exit 1
+    if ! printf '%s\n' \
+      "version=1" \
+      "domain=$identity" \
+      "alt=$alt" \
+      "owner=acme-nginx" \
+      "issuer=letsencrypt" \
+      "issued_at=$now" \
+      "not_after=$not_after" \
+      "fingerprint=$fingerprint" \
+      "updated_at=$now" \
+      "updated_by=acme-nginx" > "$meta_tmp" ||
+       ! chmod 600 "$meta_tmp" ||
+       ! mv -Tf -- "$meta_tmp" "$store_dir/meta.env"; then
+      rm -f -- "$meta_tmp"
+      if [[ -n $old_current ]]; then
+        current=$(mktemp "$store_dir/.current.XXXXXX") || exit 1
+        rm -f -- "$current"
+        ln -s -- "$old_current" "$current" && mv -Tf -- "$current" "$store_dir/current"
+      else
+        rm -f -- "$store_dir/current"
+      fi
+      rm -rf -- "$gen"
+      exit 1
+    fi
+    current_target=$(readlink "$store_dir/current" 2>/dev/null || true)
+    for generation in "$generations"/gen.*; do
+      [[ -e $generation || -L $generation ]] || continue
+      [[ $generation == "$store_dir/$current_target" ]] && continue
+      rm -rf -- "$generation" || true
+    done
+    exit 0
+  ) || warn_post_reload "shared certificate store publish failed: $identity"
+  return 0
+}
+
+finalize_deployment(){
+  store_publish "$identity" || true
+  run_post_reload_hook
 }
 
 trap cleanup_deploy_files EXIT
@@ -879,10 +1005,12 @@ fi
 
 if ! nginx_service_active; then
   commit_deployment
+  finalize_deployment
   exit 0
 fi
 if reload_nginx; then
   commit_deployment
+  finalize_deployment
   exit 0
 fi
 rollback_deployment || true
@@ -914,6 +1042,10 @@ acme_reload_hook_is_current(){
     grep -Fqx 'deployment_started=1' "$ACME_RELOAD" 2>/dev/null &&
     grep -Fqx '    restore_managed_links=1' "$ACME_RELOAD" 2>/dev/null &&
     grep -Fqx 'if reload_nginx; then' "$ACME_RELOAD" 2>/dev/null &&
+    grep -Fqx 'store_root="/etc/cert-store"' "$ACME_RELOAD" 2>/dev/null &&
+    grep -Fqx 'store_publish(){' "$ACME_RELOAD" 2>/dev/null &&
+    grep -Fqx 'finalize_deployment(){' "$ACME_RELOAD" 2>/dev/null &&
+    [[ $(grep -Fxc '  finalize_deployment' "$ACME_RELOAD" 2>/dev/null || true) -eq 2 ]] &&
     grep -Fqx '  commit_deployment' "$ACME_RELOAD" 2>/dev/null &&
     grep -Fqx '  exit 0' "$ACME_RELOAD" 2>/dev/null &&
     grep -Fqx 'rollback_deployment || true' "$ACME_RELOAD" 2>/dev/null &&
@@ -975,6 +1107,60 @@ register_acme_certificate_deployment(){
     load_certificate_metadata "$ACME_CERT" "$ACME_KEY" &&
     [[ $CERT_META_STATE == valid ]] &&
     certificate_identity_matches "$ACME_CERT" "$identity"
+}
+
+# ---- 共享证书库（/etc/cert-store，与 sb 共用）-------------------------------
+store_mode(){ [[ ${CERT_SOURCE:-own} == store ]]; }
+store_root(){ printf '%s\n' "${STORE_DIR:-/etc/cert-store}"; }
+store_domain_dir(){
+  local root
+  root=$(store_root) || return 1
+  [[ -n ${ACME_PRIMARY_DOMAIN:-} ]] || return 1
+  printf '%s/%s\n' "$root" "$ACME_PRIMARY_DOMAIN"
+}
+store_meta_path(){
+  local dir
+  dir=$(store_domain_dir) || return 1
+  printf '%s/meta.env\n' "$dir"
+}
+store_owner(){
+  local meta
+  meta=$(store_meta_path) || return 1
+  [[ -f $meta && ! -L $meta ]] || return 1
+  sed -n 's/^owner=//p' "$meta" 2>/dev/null | head -n 1
+}
+store_certificate_is_adoptable(){
+  local dir cert key fingerprint
+  store_mode || return 1
+  dir=$(store_domain_dir) || return 1
+  [[ -d $dir && ! -L $dir && -L $dir/current ]] || return 1
+  cert="$dir/current/fullchain.pem"
+  key="$dir/current/private.key"
+  [[ -f $cert && -f $key ]] || return 1
+  load_certificate_metadata "$cert" "$key" || return 1
+  [[ $CERT_META_STATE == valid ]] || return 1
+  certificate_covers_configured_domains "$cert" || return 1
+  certificate_time_valid "$cert" || return 1
+  certificate_key_matches "$cert" "$key" || return 1
+  if [[ -f $dir/meta.env && ! -L $dir/meta.env ]]; then
+    fingerprint=$(sha256sum "$cert" 2>/dev/null | awk '{print $1}') || return 1
+    [[ $(sed -n 's/^fingerprint=//p' "$dir/meta.env" | head -n 1) == "$fingerprint" ]] || return 1
+  fi
+  STORE_CERT=$cert
+  STORE_KEY=$key
+}
+adopt_store_certificate(){
+  local owner
+  store_certificate_is_adoptable || return 1
+  owner=$(store_owner 2>/dev/null || true)
+  green "已领养共享证书库证书（未签发）"
+  printf '  ssl_certificate     %s;\n' "$STORE_CERT"
+  printf '  ssl_certificate_key %s;\n' "$STORE_KEY"
+  printf '  续期负责人(owner): %s\n' "${owner:-未知}"
+  if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+    systemctl reload nginx >/dev/null 2>&1 || yellow "nginx reload 失败，请手动检查"
+  fi
+  return 0
 }
 
 issue_certificate(){

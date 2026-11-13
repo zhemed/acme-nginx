@@ -136,7 +136,8 @@ load_acme_renew_state(){
   [[ $check_count -eq 1 && $result_count -eq 1 && $exit_count -eq 1 &&
      $renewal_count -eq 1 && $fingerprint_count -eq 1 ]] || return 1
   [[ $check_epoch =~ ^[1-9][0-9]{0,11}$ ]] || return 1
-  [[ $result == renewed || $result == unchanged || $result == failed ]] || return 1
+  [[ $result == renewed || $result == unchanged || $result == skipped ||
+     $result == failed ]] || return 1
   [[ $exit_code =~ ^(0|[1-9][0-9]{0,2})$ ]] && ((exit_code <= 255)) || return 1
   [[ $renewal_epoch =~ ^(0|[1-9][0-9]{0,11})$ ]] &&
     ((renewal_epoch <= check_epoch)) || return 1
@@ -205,6 +206,7 @@ acme_renew_runner_is_current(){
   printf -v expected_cert_file 'cert_file=%q' "${ACME_CERT:-$STATE_DIR/fullchain.pem}"
   printf -v expected_state_file 'state_file=%q' "$(acme_renew_state_path)"
   printf -v expected_identity_file 'identity_file=%q' "$ACME_IDENTITY"
+  printf -v expected_store_root 'store_root=%q' "${STORE_DIR:-/etc/cert-store}"
   printf -v expected_lock_file 'lock_file=%q' "$(acme_lock_path)"
   [[ -f $runner && ! -L $runner && -x $runner ]] || return 1
   mode=$(stat -c '%a' "$runner" 2>/dev/null || true)
@@ -221,12 +223,14 @@ acme_renew_runner_is_current(){
     grep -Fqx -- "$expected_cert_file" "$runner" 2>/dev/null &&
     grep -Fqx -- "$expected_state_file" "$runner" 2>/dev/null &&
     grep -Fqx -- "$expected_identity_file" "$runner" 2>/dev/null &&
+    grep -Fqx -- "$expected_store_root" "$runner" 2>/dev/null &&
     grep -Fqx -- "$expected_lock_file" "$runner" 2>/dev/null &&
     grep -Fqx -- "  1) [[ \${1-} == --force ]] || exit 2; force=1 ;;" "$runner" 2>/dev/null &&
     grep -Fqx -- '  *) exit 2 ;;' "$runner" 2>/dev/null &&
     grep -Fqx -- 'exec 9> "$lock_file" || exit 1' "$runner" 2>/dev/null &&
     grep -Fqx -- 'if ! flock -n 9; then' "$runner" 2>/dev/null &&
-    grep -Fqx -- "  acme_identity=\$(read_runner_acme_identity) || exit 1" "$runner" 2>/dev/null &&
+    grep -Fqx -- 'acme_identity=$(read_runner_acme_identity) || exit 1' "$runner" 2>/dev/null &&
+    grep -Fqx -- '  store_owner=$(sed -n '\''s/^owner=//p'\'' "$store_meta" 2>/dev/null | head -n 1)' "$runner" 2>/dev/null &&
     grep -Fqx -- 'state_read_epoch=$(date +%s) || exit 1' "$runner" 2>/dev/null &&
     grep -Fqx -- '  if [[ -n $previous_renewal ]] && ((previous_renewal <= state_read_epoch)); then' "$runner" 2>/dev/null &&
     grep -Fqx -- "$expected_cron_command" "$runner" 2>/dev/null &&
@@ -255,6 +259,7 @@ write_acme_renew_runner(){
     printf 'cert_file=%q\n' "${ACME_CERT:-$STATE_DIR/fullchain.pem}"
     printf 'state_file=%q\n' "$state"
     printf 'identity_file=%q\n' "$ACME_IDENTITY"
+    printf 'store_root=%q\n' "${STORE_DIR:-/etc/cert-store}"
     printf 'lock_file=%q\n' "$(acme_lock_path)"
     cat <<'ACMERENEW'
 
@@ -306,9 +311,7 @@ if ! flock -n 9; then
   exec 9>&-
   exit 75
 fi
-if ((force)); then
-  acme_identity=$(read_runner_acme_identity) || exit 1
-fi
+acme_identity=$(read_runner_acme_identity) || exit 1
 
 last_renewal_epoch=0
 state_read_epoch=$(date +%s) || exit 1
@@ -321,6 +324,30 @@ if [[ -f $state_file && ! -L $state_file ]]; then
 fi
 
 before_fingerprint=$(certificate_fingerprint || true)
+store_meta="$store_root/$acme_identity/meta.env"
+if [[ -d $store_root && ! -L $store_root &&
+      -f $store_meta && ! -L $store_meta ]]; then
+  store_owner=$(sed -n 's/^owner=//p' "$store_meta" 2>/dev/null | head -n 1)
+  if [[ -n $store_owner && $store_owner != acme-nginx ]]; then
+    current_fingerprint=$(certificate_fingerprint || true)
+    check_epoch=$(date +%s) || exit 1
+    state_tmp=$(mktemp "$state_dir/.acme_renew.state.XXXXXX") || exit 1
+    trap 'rm -f -- "$state_tmp"' EXIT
+    trap 'exit 1' HUP INT TERM
+    if ! printf '%s\n' \
+      "last_check_epoch=$check_epoch" \
+      "last_result=skipped" \
+      "last_exit_code=0" \
+      "last_renewal_epoch=$last_renewal_epoch" \
+      "cert_fingerprint=$current_fingerprint" > "$state_tmp" ||
+       ! chmod 600 "$state_tmp" ||
+       ! mv -fT -- "$state_tmp" "$state_file"; then
+      exit 1
+    fi
+    trap - EXIT HUP INT TERM
+    exit 0
+  fi
+fi
 if ((force)); then
   HOME="$state_dir" "$acme_bin" --home "$acme_home" --config-home "$acme_home" --renew -d "$acme_identity" --ecc --force
 else

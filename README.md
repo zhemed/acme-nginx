@@ -132,7 +132,19 @@ bash tests/verify.sh
 
 ## 固定版本
 
-- 当前版本：0.3.0
+- 当前版本：0.4.0
 - acme.sh 固定为 `3.1.4`
 - 上游下载仅 HTTPS，并在执行前核对项目内固定的 SHA-256
 - 签发服务：Let's Encrypt（acme-v02）
+
+## 共享证书库（CERT_SOURCE=store，v0.4.0 起）
+
+与 sb 共用 `/etc/cert-store`：谁先签发谁发布，另一个领养，不再重复申请。
+
+- 配置：`CERT_SOURCE=own|store`（默认 own）、`STORE_DIR=/etc/cert-store`。
+- `CERT_SOURCE=store` 时：
+  - `issue` 先检查库中该域名的证书（有效期/SAN 覆盖/公私钥/指纹），可用则直接领养并 reload nginx，不调用 acme.sh；
+  - 库中没有可用证书且 owner 是本工具/空/无 owner 时正常签发；reload hook 在部署成功后自动把证书发布进库（owner=acme-nginx），并执行 `/etc/acme-nginx/post_reload.sh`（用于重启 sb，例如内容 `systemctl restart sb`）；
+  - 续期：只有 `meta.env` 的 owner 工具续期；非 owner 的续期 runner 记录 `skipped` 并跳过。
+- nginx 引用路径（store 模式）：`/etc/cert-store/<DOMAIN>/current/fullchain.pem` 与 `.../private.key`。
+- `uninstall` 不会删除 `/etc/cert-store`。

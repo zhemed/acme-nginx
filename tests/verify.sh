@@ -34,12 +34,27 @@ grep -Fq -- 'https://codeload.github.com/acmesh-official/acme.sh/tar.gz/refs/tag
 if grep -Fq -- '--install-online' "$ROOT_DIR/acme-nginx.sh"; then
   fail "unverified acme.sh online installer remains"
 fi
-[[ $(grep -Fxc 'acme_nginx_version="v0.3.0"' "$ROOT_DIR/acme-nginx.sh" || true) -eq 1 ]] ||
-  fail "script version is not 0.3.0"
-[[ $(tr -d '\r\n' < "$ROOT_DIR/VERSION") == '0.3.0' ]] ||
-  fail "VERSION file is not 0.3.0"
-grep -Fq -- "当前版本：0.3.0" "$ROOT_DIR/README.md" ||
-  fail "README project version is not 0.3.0"
+[[ $(grep -Fxc 'acme_nginx_version="v0.4.0"' "$ROOT_DIR/acme-nginx.sh" || true) -eq 1 ]] ||
+  fail "script version is not 0.4.0"
+[[ $(tr -d '\r\n' < "$ROOT_DIR/VERSION") == '0.4.0' ]] ||
+  fail "VERSION file is not 0.4.0"
+grep -Fq -- "当前版本：0.4.0" "$ROOT_DIR/README.md" ||
+  fail "README project version is not 0.4.0"
+
+for store_pattern in \
+  'CERT_SOURCE=store' \
+  'store_certificate_is_adoptable(){' \
+  'adopt_store_certificate(){' \
+  'store_publish(){' \
+  'finalize_deployment(){' \
+  'store_owner(){'; do
+  grep -Fq -- "$store_pattern" "$ROOT_DIR/acme-nginx.sh" ||
+    fail "shared certificate store support is missing: $store_pattern"
+done
+for store_text in '/etc/cert-store' '共享证书库'; do
+  grep -Fq -- "$store_text" "$ROOT_DIR/README.md" ||
+    fail "README does not document the shared certificate store: $store_text"
+done
 
 # shellcheck disable=SC2016
 for pattern in \

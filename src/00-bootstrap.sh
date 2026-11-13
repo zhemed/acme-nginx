@@ -24,7 +24,7 @@ ACME_RELOAD="$STATE_DIR/reload.sh"
 ACME_LOCK="/run/acme-nginx.lock"
 ACME_RENEW_RUNNER="$STATE_DIR/renew.sh"
 ACME_RENEW_STATE="$STATE_DIR/renew.state"
-ACME_RELOAD_IDENTITY="# acme-nginx-reload-v1"
+ACME_RELOAD_IDENTITY="# acme-nginx-reload-v2"
 ACME_RENEW_IDENTITY="# acme-nginx-renew-v1"
 ACME_CRON_MARKER="# acme-nginx-managed"
 ACME_LOCK_FD=
@@ -38,6 +38,8 @@ HUAWEICLOUD_ACCESS_KEY_ID=
 HUAWEICLOUD_SECRET_ACCESS_KEY=
 HUAWEICLOUD_REGION=
 STAGING=0
+CERT_SOURCE=own
+STORE_DIR=/etc/cert-store
 
 red(){ echo -e "\033[31m\033[01m$1\033[0m";}
 green(){ echo -e "\033[32m\033[01m$1\033[0m";}
@@ -48,7 +50,7 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-acme_nginx_version="v0.3.0"
+acme_nginx_version="v0.4.0"
 
 valid_ipv4(){
   local ip=$1 IFS=. octets octet
@@ -179,6 +181,10 @@ write_config_template(){
     printf '%s\n' 'DOMAIN='
     printf '%s\n' '# 是否同时申请泛域名证书：1 表示同时签 *.DOMAIN'
     printf '%s\n' 'WILDCARD=0'
+    printf '%s\n' '# 证书来源：own=本工具签发；store=领养 /etc/cert-store 共享证书库（与 sb 共用）'
+    printf '%s\n' 'CERT_SOURCE=own'
+    printf '%s\n' '# 共享证书库目录（CERT_SOURCE=store 时使用）'
+    printf '%s\n' 'STORE_DIR=/etc/cert-store'
   } > "$tmp" || ! chmod 600 "$tmp" || ! mv -fT -- "$tmp" "$CONFIG_FILE"; then
     rm -f "$tmp"
     return 1
@@ -189,8 +195,9 @@ load_config(){
   local line key value
   local provider_count=0 account_count=0 token_count=0 domain_count=0 wildcard_count=0
   local hw_ak_count=0 hw_sk_count=0 hw_region_count=0 staging_count=0
+  local source_count=0 store_dir_count=0
   local provider='' account='' token='' domain='' wildcard=''
-  local hw_ak='' hw_sk='' hw_region='' staging=''
+  local hw_ak='' hw_sk='' hw_region='' staging='' source='' store_dir=''
   [[ -f $CONFIG_FILE && ! -L $CONFIG_FILE ]] || return 1
   config_mode_is_private || return 1
   while IFS= read -r line || [[ -n $line ]]; do
@@ -237,17 +244,30 @@ load_config(){
         wildcard_count=$((wildcard_count + 1))
         wildcard=$value
         ;;
+      CERT_SOURCE)
+        source_count=$((source_count + 1))
+        source=$value
+        ;;
+      STORE_DIR)
+        store_dir_count=$((store_dir_count + 1))
+        store_dir=$value
+        ;;
       *) return 1 ;;
     esac
   done < "$CONFIG_FILE"
   [[ $provider_count -le 1 && $account_count -le 1 && $token_count -le 1 &&
      $hw_ak_count -le 1 && $hw_sk_count -le 1 && $hw_region_count -le 1 &&
-     $staging_count -le 1 && $domain_count -eq 1 && $wildcard_count -eq 1 ]] || return 1
+     $staging_count -le 1 && $domain_count -eq 1 && $wildcard_count -eq 1 &&
+     $source_count -le 1 && $store_dir_count -le 1 ]] || return 1
   provider=${provider:-cloudflare}
   valid_dns_provider "$provider" || return 1
   [[ $wildcard == 0 || $wildcard == 1 ]] || return 1
   staging=${staging:-0}
   [[ $staging == 0 || $staging == 1 ]] || return 1
+  source=${source:-own}
+  [[ $source == own || $source == store ]] || return 1
+  store_dir=${store_dir:-/etc/cert-store}
+  [[ $store_dir =~ ^/[A-Za-z0-9._/-]{1,200}$ && $store_dir != */../* ]] || return 1
   normalize_acme_domain "$domain" || return 1
   DNS_PROVIDER=$provider
   CF_ACCOUNT_ID=
@@ -256,6 +276,8 @@ load_config(){
   HUAWEICLOUD_SECRET_ACCESS_KEY=
   HUAWEICLOUD_REGION=
   STAGING=$staging
+  CERT_SOURCE=$source
+  STORE_DIR=$store_dir
   if [[ $wildcard == 1 ]]; then
     ACME_WILDCARD_DOMAIN="*.$ACME_PRIMARY_DOMAIN"
   else

@@ -50,7 +50,7 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-acme_nginx_version="v0.7.2"
+acme_nginx_version="v0.7.3"
 
 valid_ipv4(){
   local ip=$1 IFS=. octets octet
@@ -296,23 +296,33 @@ load_config(){
   else
     ACME_WILDCARD_DOMAIN=
   fi
-  case $provider in
-    cloudflare)
-      [[ $account_count -eq 1 && $token_count -eq 1 ]] || return 1
-      valid_cloudflare_account_id "$account" || return 1
-      [[ $token =~ ^[A-Za-z0-9_-]{10,200}$ ]] || return 1
-      CF_ACCOUNT_ID=$account
-      CF_TOKEN=$token
-      ;;
-    huaweicloud)
-      [[ $hw_ak_count -eq 1 && $hw_sk_count -eq 1 && $hw_region_count -eq 1 ]] || return 1
-      [[ -n $hw_ak && -n $hw_sk && -n $hw_region ]] || return 1
-      [[ $hw_ak =~ ^[A-Za-z0-9_-]{16,64}$ ]] || return 1
-      [[ $hw_sk =~ ^[A-Za-z0-9+/=_-]{16,128}$ ]] || return 1
-      [[ $hw_region =~ ^[A-Za-z0-9_-]{2,32}$ ]] || return 1
-      HUAWEICLOUD_ACCESS_KEY_ID=$hw_ak
-      HUAWEICLOUD_SECRET_ACCESS_KEY=$hw_sk
-      HUAWEICLOUD_REGION=$hw_region
-      ;;
-  esac
+  # store 模式（消费者）不需要 DNS 供应商凭据：续期由共享库 owner 负责。
+  # 仅显式接管（force-renew / takeover）真正签发时才需要，届时由 issue_certificate 明确报错。
+  if [[ $source == own ]]; then
+    case $provider in
+      cloudflare)
+        [[ $account_count -eq 1 && $token_count -eq 1 ]] || return 1
+        valid_cloudflare_account_id "$account" || return 1
+        [[ $token =~ ^[A-Za-z0-9_-]{10,200}$ ]] || return 1
+        CF_ACCOUNT_ID=$account
+        CF_TOKEN=$token
+        ;;
+      huaweicloud)
+        [[ $hw_ak_count -eq 1 && $hw_sk_count -eq 1 && $hw_region_count -eq 1 ]] || return 1
+        [[ -n $hw_ak && -n $hw_sk && -n $hw_region ]] || return 1
+        [[ $hw_ak =~ ^[A-Za-z0-9_-]{16,64}$ ]] || return 1
+        [[ $hw_sk =~ ^[A-Za-z0-9+/=_-]{16,128}$ ]] || return 1
+        [[ $hw_region =~ ^[A-Za-z0-9_-]{2,32}$ ]] || return 1
+        HUAWEICLOUD_ACCESS_KEY_ID=$hw_ak
+        HUAWEICLOUD_SECRET_ACCESS_KEY=$hw_sk
+        HUAWEICLOUD_REGION=$hw_region
+        ;;
+    esac
+  else
+    CF_ACCOUNT_ID=
+    CF_TOKEN=
+    HUAWEICLOUD_ACCESS_KEY_ID=
+    HUAWEICLOUD_SECRET_ACCESS_KEY=
+    HUAWEICLOUD_REGION=
+  fi
 }

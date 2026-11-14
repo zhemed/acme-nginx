@@ -169,8 +169,9 @@ load_config(){
   local line key value
   local provider_count=0 account_count=0 token_count=0 domain_count=0 wildcard_count=0
   local hw_ak_count=0 hw_sk_count=0 hw_region_count=0 staging_count=0
+  local source_count=0 store_dir_count=0
   local provider='' account='' token='' domain='' wildcard=''
-  local hw_ak='' hw_sk='' hw_region='' staging=''
+  local hw_ak='' hw_sk='' hw_region='' staging='' source='' store_dir=''
   [[ -f $CONFIG_FILE && ! -L $CONFIG_FILE ]] || return 1
   config_mode_is_private || return 1
   while IFS= read -r line || [[ -n $line ]]; do
@@ -217,17 +218,32 @@ load_config(){
         wildcard_count=$((wildcard_count + 1))
         wildcard=$value
         ;;
+      CERT_SOURCE)
+        source_count=$((source_count + 1))
+        source=$value
+        ;;
+      STORE_DIR)
+        store_dir_count=$((store_dir_count + 1))
+        store_dir=$value
+        ;;
       *) return 1 ;;
     esac
   done < "$CONFIG_FILE"
   [[ $provider_count -le 1 && $account_count -le 1 && $token_count -le 1 &&
      $hw_ak_count -le 1 && $hw_sk_count -le 1 && $hw_region_count -le 1 &&
-     $staging_count -le 1 && $domain_count -eq 1 && $wildcard_count -eq 1 ]] || return 1
+     $staging_count -le 1 && $domain_count -eq 1 && $wildcard_count -eq 1 &&
+     $source_count -le 1 && $store_dir_count -le 1 ]] || return 1
   provider=${provider:-cloudflare}
   valid_dns_provider "$provider" || return 1
   [[ $wildcard == 0 || $wildcard == 1 ]] || return 1
   staging=${staging:-0}
   [[ $staging == 0 || $staging == 1 ]] || return 1
+  source=${source:-own}
+  [[ $source == own || $source == store ]] || return 1
+  store_dir=${store_dir:-/etc/cert-store}
+  valid_store_root "$store_dir" || return 1
+  CERT_SOURCE=$source
+  STORE_DIR=$store_dir
   normalize_acme_domain "$domain" || return 1
   DNS_PROVIDER=$provider
   CF_ACCOUNT_ID=
@@ -241,7 +257,8 @@ load_config(){
   else
     ACME_WILDCARD_DOMAIN=
   fi
-  case $provider in
+  if [[ $source == own ]]; then
+    case $provider in
     cloudflare)
       [[ $account_count -eq 1 && $token_count -eq 1 ]] || return 1
       valid_cloudflare_account_id "$account" || return 1
@@ -261,7 +278,14 @@ load_config(){
       HUAWEICLOUD_SECRET_ACCESS_KEY=$hw_sk
       HUAWEICLOUD_REGION=$hw_region
       ;;
-  esac
+    esac
+  else
+    CF_ACCOUNT_ID=
+    CF_TOKEN=
+    HUAWEICLOUD_ACCESS_KEY_ID=
+    HUAWEICLOUD_SECRET_ACCESS_KEY=
+    HUAWEICLOUD_REGION=
+  fi
 }
 
 write_config_fixture(){
@@ -290,6 +314,21 @@ expect_success "valid config is loaded" load_config
    $ACME_PRIMARY_DOMAIN == example.com && -z $ACME_WILDCARD_DOMAIN ]] ||
   fail "valid config values"
 pass "valid config values"
+
+# store 模式（消费者）不需要 DNS 供应商凭据
+write_config_fixture cloudflare 0
+printf '%s\n' 'CERT_SOURCE=store' 'STORE_DIR=/etc/cert-store' >> "$CONFIG_FILE"
+sed -i 's/^CF_ACCOUNT_ID=.*/CF_ACCOUNT_ID=/; s/^CF_TOKEN=.*/CF_TOKEN=/' "$CONFIG_FILE"
+chmod 600 "$CONFIG_FILE"
+expect_success "store-mode config loads without DNS credentials" load_config
+[[ $CERT_SOURCE == store ]] || fail "store source value"
+pass "store-mode config loads without DNS credentials"
+
+# own 模式仍必须提供凭据
+write_config_fixture cloudflare 0
+sed -i 's/^CF_ACCOUNT_ID=.*/CF_ACCOUNT_ID=/; s/^CF_TOKEN=.*/CF_TOKEN=/' "$CONFIG_FILE"
+chmod 600 "$CONFIG_FILE"
+expect_failure "own-mode config without DNS credentials is rejected" load_config
 
 write_config_fixture cloudflare 1
 expect_success "wildcard config is loaded" load_config

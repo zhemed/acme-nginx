@@ -132,7 +132,7 @@ bash tests/verify.sh
 
 ## 固定版本
 
-- 当前版本：0.7.1
+- 当前版本：0.7.2
 - acme.sh 固定为 `3.1.4`
 - 上游下载仅 HTTPS，并在执行前核对项目内固定的 SHA-256
 - 签发服务：Let's Encrypt（acme-v02）
@@ -157,7 +157,8 @@ bash tests/verify.sh
     "存活"工具则拒绝签发；否则把 owner 置为本工具占位，签发失败/取消/中断时回滚原 owner，
     成功则保持 owner 并由发布流程写回。显式接管（force-renew / renew 接管）会传 skip_claim=1
     跳过存活检查；meta 损坏时 claim 直接拒绝并提示修复。runner 在 store 锁获取失败时写
-    `skipped` 状态并跳过本次（无证书指纹时记 `failed`），有 logger 时同时记录系统日志。
+    `skipped` 状态并跳过本次（无证书指纹时记 `failed` 并以非 0 退出，进程退出码与 state
+    保持一致），有 logger 时同时记录系统日志。
   - **own 模式**：库内存在同域名存活他方 owner 时，本工具 own 模式手动签发也会被 claim 拒绝
     （提示用 force-renew 接管）——这是防双签设计，避免两个工具同时向 CA 申请同一域名。
 - nginx 引用路径（store 模式）：`/etc/cert-store/<DOMAIN>/current/fullchain.pem` 与 `.../private.key`。

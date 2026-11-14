@@ -34,12 +34,12 @@ grep -Fq -- 'https://codeload.github.com/acmesh-official/acme.sh/tar.gz/refs/tag
 if grep -Fq -- '--install-online' "$ROOT_DIR/acme-nginx.sh"; then
   fail "unverified acme.sh online installer remains"
 fi
-[[ $(grep -Fxc 'acme_nginx_version="v0.7.1"' "$ROOT_DIR/acme-nginx.sh" || true) -eq 1 ]] ||
-  fail "script version is not 0.7.1"
-[[ $(tr -d '\r\n' < "$ROOT_DIR/VERSION") == '0.7.1' ]] ||
-  fail "VERSION file is not 0.7.1"
-grep -Fq -- "当前版本：0.7.1" "$ROOT_DIR/README.md" ||
-  fail "README project version is not 0.7.1"
+[[ $(grep -Fxc 'acme_nginx_version="v0.7.2"' "$ROOT_DIR/acme-nginx.sh" || true) -eq 1 ]] ||
+  fail "script version is not 0.7.2"
+[[ $(tr -d '\r\n' < "$ROOT_DIR/VERSION") == '0.7.2' ]] ||
+  fail "VERSION file is not 0.7.2"
+grep -Fq -- "当前版本：0.7.2" "$ROOT_DIR/README.md" ||
+  fail "README project version is not 0.7.2"
 
 for store_pattern in \
   'CERT_SOURCE=store' \
@@ -92,7 +92,7 @@ fi
 # shellcheck disable=SC2016
 for ordering_pattern in \
   '# acme-nginx-reload-v5' \
-  '# acme-nginx-renew-v6' \
+  '# acme-nginx-renew-v7' \
   '共享证书库锁获取失败，跳过本次续期（无法确认续期负责人）' \
   'store_publish "$identity" || true' \
   '  if exec 8> "$store_root/.lock"; then' \
@@ -121,7 +121,8 @@ for claim_pattern in \
   'store_meta_is_valid(){' \
   'shared certificate store meta is corrupt; skip publish' \
   'shared certificate store already has a newer certificate; skip publishing older one' \
-  '没有可用证书指纹时不能写 skipped'; do
+  '没有可用证书指纹时不能写 skipped' \
+  'write_skipped_state "$current_fingerprint" || exit 1'; do
   grep -Fq -- "$claim_pattern" "$ROOT_DIR/acme-nginx.sh" ||
     fail "v0.7.1 pre-issue claim/fail-closed support is missing: $claim_pattern"
 done

@@ -72,7 +72,7 @@ export ACME_CRON_MARKER="# acme-nginx-managed"
 export ACME_RELOAD_IDENTITY="# acme-nginx-reload-v5"
 export CERT_SOURCE=own
 export STORE_DIR=/etc/cert-store
-export ACME_RENEW_IDENTITY="# acme-nginx-renew-v6"
+export ACME_RENEW_IDENTITY="# acme-nginx-renew-v7"
 export ACME_VERSION="3.1.4"
 export ACME_ARCHIVE_SHA256="e5f8e187bbf5251e0cd8891f2622daab9850366bd17bea9f92c2fe2ee091fd32"
 export ACME_RENEW_RUNNER="$STATE_DIR/renew.sh"
@@ -542,7 +542,7 @@ runner_fails_closed_when_store_lock_is_unavailable(){
   (
     local store="$TEMP_DIR/runner-lock-fail-store" marker="$TEMP_DIR/runner-lock-fail-called"
     local fakebin="$TEMP_DIR/fake-logger-bin" logger_log="$TEMP_DIR/fake-logger.log"
-    local output fingerprint
+    local output fingerprint rc=0
     printf '%s\n' 'example.com' > "$ACME_IDENTITY"
     printf '%s\n' 'cert-body-for-fingerprint' > "$ACME_CERT"
     rm -rf "$store" "$marker" "$fakebin" "$logger_log"
@@ -561,7 +561,9 @@ runner_fails_closed_when_store_lock_is_unavailable(){
       "cert_fingerprint=$(printf 'a%.0s' {1..64})" > "$ACME_RENEW_STATE"
     chmod 600 "$ACME_RENEW_STATE"
     STORE_DIR="$store" write_acme_renew_runner || return 1
-    output=$(PATH="$fakebin:$PATH" "$ACME_RENEW_RUNNER" 2>&1) || return 1
+    output=$(PATH="$fakebin:$PATH" "$ACME_RENEW_RUNNER" 2>&1) || rc=$?
+    # 有指纹时写 skipped/exit 0，进程也必须是 0（退出码与 state 一致）。
+    [[ $rc -eq 0 ]] || return 1
     [[ ! -e $marker ]] || return 1
     [[ $output == *'共享证书库锁获取失败'* ]] || return 1
     grep -Fq '共享证书库锁获取失败' "$logger_log" || return 1
@@ -1320,7 +1322,7 @@ runner_fails_closed_records_failed_without_fingerprint(){
   (
     local store="$TEMP_DIR/runner-lock-fail-store2" marker="$TEMP_DIR/runner-lock-fail-called2"
     local fakebin="$TEMP_DIR/fake-logger-bin2" logger_log="$TEMP_DIR/fake-logger2.log"
-    local output
+    local output rc=0
     printf '%s\n' 'example.com' > "$ACME_IDENTITY"
     rm -rf "$store" "$marker" "$fakebin" "$logger_log"
     rm -f "$ACME_CERT" "$ACME_RENEW_STATE"
@@ -1331,7 +1333,9 @@ runner_fails_closed_records_failed_without_fingerprint(){
     printf '%s\n' '#!/bin/bash' ": > '$marker'" 'exit 0' > "$ACME_BIN"
     chmod 700 "$ACME_BIN"
     STORE_DIR="$store" write_acme_renew_runner || return 1
-    output=$(PATH="$fakebin:$PATH" "$ACME_RENEW_RUNNER" 2>&1) || return 1
+    output=$(PATH="$fakebin:$PATH" "$ACME_RENEW_RUNNER" 2>&1) || rc=$?
+    # 无指纹时 state 记 failed/exit 1，进程必须同样以非 0 退出。
+    [[ $rc -eq 1 ]] || return 1
     [[ ! -e $marker ]] || return 1
     [[ $output == *'共享证书库锁获取失败'* ]] || return 1
     load_acme_renew_state || return 1
